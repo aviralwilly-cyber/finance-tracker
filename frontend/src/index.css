@@ -1,0 +1,6 @@
+* { box-sizing: border-box; }
+body { margin: 0; background: #fafafa; color: #111; }
+input, button { font-family: inherit; font-size: 14px; border-radius: 6px; border: 1px solid #ccc; }
+button { cursor: pointer; background: #111; color: white; border: none; }
+button:disabled { opacity: 0.6; cursor: default; }
+table { font-size: 14px; }
