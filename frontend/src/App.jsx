@@ -1,12 +1,16 @@
 import { useEffect, useState } from 'react'
 import { onAuthStateChanged } from 'firebase/auth'
 import { auth } from './firebase'
+import { authedFetch } from './api'
 import Login from './Login'
+import Onboarding from './Onboarding'
 import Dashboard from './Dashboard'
 
 export default function App() {
   const [user, setUser] = useState(null)
   const [checkingAuth, setCheckingAuth] = useState(true)
+  const [profile, setProfile] = useState(null)
+  const [checkingProfile, setCheckingProfile] = useState(false)
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (u) => {
@@ -16,9 +20,23 @@ export default function App() {
     return unsubscribe
   }, [])
 
-  if (checkingAuth) {
-    return <p style={{ textAlign: 'center', marginTop: 80, fontFamily: 'system-ui, sans-serif', color: '#666' }}>Loading…</p>
+  useEffect(() => {
+    if (!user) {
+      setProfile(null)
+      return
+    }
+    setCheckingProfile(true)
+    authedFetch('/profile')
+      .then(res => res.json())
+      .then(setProfile)
+      .finally(() => setCheckingProfile(false))
+  }, [user])
+
+  if (checkingAuth || (user && checkingProfile)) {
+    return <p className="text-center mt-20 text-slate-500 text-sm">Loading…</p>
   }
 
-  return user ? <Dashboard user={user} /> : <Login />
+  if (!user) return <Login />
+  if (!profile?.displayName) return <Onboarding onComplete={setProfile} />
+  return <Dashboard user={user} profile={profile} />
 }
