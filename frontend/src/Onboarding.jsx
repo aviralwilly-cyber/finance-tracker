@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { authedFetch } from './api'
+import MoneyBagIcon from './MoneyBagIcon'
 
 const PURPOSES = [
   { value: 'self', label: 'Personal use', blurb: 'Track my own everyday spending' },
@@ -29,7 +30,9 @@ export default function Onboarding({ onComplete }) {
   return (
     <div className="min-h-screen bg-gray-50 flex items-center justify-center px-6">
       <div className="w-full max-w-md bg-white rounded-2xl shadow-lg border border-gray-200 p-8">
-        <h1 className="text-2xl font-bold text-navy mb-1">💰 Welcome</h1>
+        <h1 className="text-2xl font-bold text-navy mb-1 flex items-center gap-2">
+          <MoneyBagIcon className="w-7 h-7" /> Welcome
+        </h1>
         <p className="text-slate-500 text-sm mb-6">A couple of quick questions to set things up.</p>
 
         <form onSubmit={submit} className="flex flex-col gap-6">

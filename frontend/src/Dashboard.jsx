@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend, BarChart, Bar, XAxis, YAxis, CartesianGrid } from 'recharts'
 import { signOut } from 'firebase/auth'
-import { Sun, Moon, Mic, Upload } from 'lucide-react'
+import { Mic, Upload, ChevronLeft, ChevronRight, LayoutDashboard, Receipt, PiggyBank, Wallet, MessageCircle } from 'lucide-react'
 import { auth } from './firebase'
 import { authedFetch } from './api'
 import ConfirmDialog from './ConfirmDialog'
@@ -9,15 +10,17 @@ import { useToasts, ToastContainer } from './Toast'
 import CategoryIcon from './CategoryIcon'
 import { SkeletonCard } from './Skeleton'
 import ImportWizard from './ImportWizard'
+import Sidebar from './Sidebar'
+import Lightfall from './Lightfall'
 
 const COLORS = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#06b6d4', '#a855f7', '#ec4899', '#84cc16', '#f97316', '#14b8a6', '#64748b']
 const SAVINGS_COLORS = ['#4ade80', '#60a5fa', '#facc15', '#a78bfa']
 const TABS = [
-  { id: 'overview', label: 'Overview' },
-  { id: 'transactions', label: 'Transactions' },
-  { id: 'savings', label: 'Savings' },
-  { id: 'budgets', label: 'Budgets' },
-  { id: 'chat', label: 'Chat' }
+  { id: 'overview', label: 'Overview', icon: LayoutDashboard },
+  { id: 'transactions', label: 'Transactions', icon: Receipt },
+  { id: 'savings', label: 'Savings', icon: PiggyBank },
+  { id: 'budgets', label: 'Budgets', icon: Wallet },
+  { id: 'chat', label: 'Chat', icon: MessageCircle }
 ]
 
 export default function Dashboard({ user, profile }) {
@@ -27,17 +30,38 @@ export default function Dashboard({ user, profile }) {
   const [activeTab, setActiveTab] = useState('overview')
   const [initialLoading, setInitialLoading] = useState(true)
 
-  const [dark, setDark] = useState(() => {
-    if (typeof window === 'undefined') return false
-    const saved = localStorage.getItem('theme')
-    if (saved) return saved === 'dark'
-    return window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false
-  })
+  // "Hide on scroll" for the overview header, using the same core technique
+  // HeroUI's Navbar uses: animating only transform/opacity, both compositor-
+  // only properties, so the browser never has to recalculate layout during
+  // the animation — that's what makes this smooth where the earlier height-
+  // based version wasn't. (Kept `position: sticky` rather than `fixed` to
+  // avoid coordinating with the sidebar's own collapsible width.)
+  const [headerHidden, setHeaderHidden] = useState(false)
+  const lastScrollY = useRef(0)
+  const scrollTicking = useRef(false)
 
   useEffect(() => {
-    document.documentElement.classList.toggle('dark', dark)
-    localStorage.setItem('theme', dark ? 'dark' : 'light')
-  }, [dark])
+    const handleScroll = () => {
+      if (scrollTicking.current) return
+      scrollTicking.current = true
+
+      requestAnimationFrame(() => {
+        const currentY = window.scrollY
+        const delta = currentY - lastScrollY.current
+
+        if (delta > 8 && currentY > 80) {
+          setHeaderHidden(true)
+        } else if (delta < -8) {
+          setHeaderHidden(false)
+        }
+
+        lastScrollY.current = currentY
+        scrollTicking.current = false
+      })
+    }
+    window.addEventListener('scroll', handleScroll, { passive: true })
+    return () => window.removeEventListener('scroll', handleScroll)
+  }, [])
 
   const [transactions, setTransactions] = useState([])
   const [summary, setSummary] = useState({})
@@ -52,6 +76,7 @@ export default function Dashboard({ user, profile }) {
   const [showIncomeForm, setShowIncomeForm] = useState(false)
   const [incomeForm, setIncomeForm] = useState({ amount: '', frequency: 'monthly', effectiveDate: '' })
   const [savingIncome, setSavingIncome] = useState(false)
+  const [editingIncomeId, setEditingIncomeId] = useState(null)
 
   const [savings, setSavings] = useState([])
   const [savingsSummary, setSavingsSummary] = useState({})
@@ -71,6 +96,8 @@ export default function Dashboard({ user, profile }) {
 
   const [searchText, setSearchText] = useState('')
   const [categoryFilter, setCategoryFilter] = useState('All')
+  const [currentPage, setCurrentPage] = useState(1)
+  const TRANSACTIONS_PER_PAGE = 10
 
   const [recurring, setRecurring] = useState([])
   const [showRecurringForm, setShowRecurringForm] = useState(false)
@@ -215,16 +242,47 @@ export default function Dashboard({ user, profile }) {
     e.preventDefault()
     if (!incomeForm.amount || !incomeForm.effectiveDate) return
     setSavingIncome(true)
+    // Editing replaces the old entry rather than leaving a stale duplicate —
+    // income has no update endpoint, so a clean replace (delete + create)
+    // keeps the history accurate.
+    if (editingIncomeId) {
+      await authedFetch(`/income/${editingIncomeId}`, { method: 'DELETE' })
+    }
     await authedFetch('/income', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(incomeForm)
     })
     setIncomeForm({ amount: '', frequency: 'monthly', effectiveDate: '' })
+    setEditingIncomeId(null)
     setShowIncomeForm(false)
     await loadData()
     setSavingIncome(false)
-    showToast('Income updated')
+    showToast(editingIncomeId ? 'Income entry updated' : 'Income updated')
+  }
+
+  const startEditIncome = (entry) => {
+    setIncomeForm({ amount: entry.amount, frequency: entry.frequency, effectiveDate: entry.effectiveDate })
+    setEditingIncomeId(entry.id)
+    setShowIncomeForm(true)
+  }
+
+  const cancelIncomeForm = () => {
+    setIncomeForm({ amount: '', frequency: 'monthly', effectiveDate: '' })
+    setEditingIncomeId(null)
+    setShowIncomeForm(false)
+  }
+
+  const deleteIncome = (id, effectiveDate) => {
+    setConfirmState({
+      message: `Delete the income entry effective from ${effectiveDate}? This can't be undone.`,
+      onConfirm: async () => {
+        await authedFetch(`/income/${id}`, { method: 'DELETE' })
+        setConfirmState(null)
+        await loadData()
+        showToast('Income entry deleted')
+      }
+    })
   }
 
   const addSavings = async (e) => {
@@ -335,61 +393,85 @@ export default function Dashboard({ user, profile }) {
     .filter(t => categoryFilter === 'All' || t.category === categoryFilter)
     .filter(t => !searchText.trim() || t.description.toLowerCase().includes(searchText.trim().toLowerCase()))
 
+  useEffect(() => { setCurrentPage(1) }, [selectedMonth, categoryFilter, searchText])
+
+  const totalPages = Math.max(1, Math.ceil(filteredTransactions.length / TRANSACTIONS_PER_PAGE))
+  const pageSafe = Math.min(currentPage, totalPages)
+  const paginatedTransactions = filteredTransactions.slice(
+    (pageSafe - 1) * TRANSACTIONS_PER_PAGE,
+    pageSafe * TRANSACTIONS_PER_PAGE
+  )
+
   const chartData = Object.entries(
     filteredTransactions.reduce((acc, t) => {
       acc[t.category] = (acc[t.category] || 0) + t.amount
       return acc
     }, {})
-  ).map(([name, value]) => ({ name, value }))
+  ).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value)
   const savingsChartData = Object.entries(savingsSummary).map(([name, value]) => ({ name, value }))
 
   return (
-    <div className="min-h-screen bg-gray-50 dark:bg-gray-950 transition-colors">
-      {/* Sticky header + overview */}
-      <div className="sticky top-0 z-20 bg-gray-50/95 dark:bg-gray-950/95 backdrop-blur border-b border-gray-200 dark:border-gray-800">
-        <div className="max-w-5xl mx-auto px-6 pt-6 pb-4">
-          <div className="flex justify-between items-start mb-4">
-            <div>
-              <h1 className="text-2xl font-bold text-navy dark:text-gray-100 flex items-center gap-2">💰 AI Finance Tracker</h1>
-              <p className="text-slate-500 dark:text-slate-400 text-sm mt-1">
-                {profile?.displayName ? `Welcome back, ${profile.displayName}.` : 'Add a transaction and AI will categorize it automatically.'}
-              </p>
-            </div>
-            <div className="flex items-start gap-3">
-              <button
-                onClick={() => setDark(d => !d)}
-                title={dark ? 'Switch to light mode' : 'Switch to dark mode'}
-                className="p-2 rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 text-navy dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-              >
-                {dark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
-              </button>
-              <div className="text-right">
-                <p className="text-slate-500 dark:text-slate-400 text-xs mb-1">{user.email}</p>
-                <button
-                  onClick={() => signOut(auth)}
-                  className="text-xs px-3 py-1.5 rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 text-navy dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                >
-                  Log out
-                </button>
-              </div>
-            </div>
-          </div>
+    <div className="min-h-screen transition-colors flex relative">
+      {/* Ambient background — sits behind everything; toned down vs. the login
+          screen (fewer streaks, lower opacity, no mouse interaction) so it
+          stays a subtle backdrop and doesn't compete with the data. */}
+      <div className="fixed inset-0 z-0 pointer-events-none opacity-40 dark:opacity-60">
+        <Lightfall
+          colors={['#64ffda', '#8892b0', '#112240']}
+          backgroundColor="#0a192f"
+          speed={0.3}
+          streakCount={1}
+          streakWidth={1}
+          streakLength={1}
+          glow={0.7}
+          density={0.5}
+          twinkle={0.6}
+          zoom={3}
+          backgroundGlow={0.3}
+          opacity={1}
+          mouseInteraction={false}
+        />
+      </div>
 
-          {!initialLoading && (
-            <>
-              {/* Overview card */}
-              <div className="bg-navy dark:bg-gray-900 dark:border dark:border-gray-800 text-white rounded-2xl shadow-lg p-5">
-                {overview && overview.hasIncomeConfigured ? (
-                  <div className="flex flex-wrap items-center justify-between gap-6">
-                    <div className="flex flex-wrap gap-8">
-                      <Stat label="Monthly income" value={`$${overview.monthlyIncome.toFixed(2)}`} />
-                      <Stat label="Spent this month" value={`$${overview.spentThisMonth.toFixed(2)}`} />
-                      <Stat label="Saved this month" value={`$${overview.savedThisMonth.toFixed(2)}`} accent="text-mint" />
-                      <Stat
-                        label="Remaining"
-                        value={`$${overview.remaining.toFixed(2)}`}
-                        accent={overview.remaining >= 0 ? 'text-mint' : 'text-red-400'}
-                      />
+      <Sidebar
+        tabs={TABS}
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        userEmail={user.email}
+        onLogout={() => signOut(auth)}
+      />
+
+      <div className="flex-1 min-w-0 relative z-10">
+        {/* Sticky page header + overview — hides on scroll down, reappears on scroll up */}
+        <motion.div
+          className="sticky top-0 z-20 bg-gray-50/80 dark:bg-gray-950/80 backdrop-blur-md border-b border-gray-200 dark:border-gray-800"
+          animate={{
+            y: headerHidden ? '-100%' : '0%',
+            opacity: headerHidden ? 0 : 1
+          }}
+          style={{ pointerEvents: headerHidden ? 'none' : 'auto' }}
+          transition={{ duration: 0.2, ease: 'easeInOut' }}
+        >
+          <div className="max-w-4xl mx-auto px-6 pt-6 pb-4">
+            <p className="text-slate-500 dark:text-slate-400 text-sm mb-4">
+              {profile?.displayName ? `Welcome back, ${profile.displayName}.` : 'Add a transaction and AI will categorize it automatically.'}
+            </p>
+
+            {!initialLoading && (
+              <>
+                {/* Overview card */}
+                <div className="bg-navy/95 dark:bg-gray-900/90 backdrop-blur-md dark:border dark:border-gray-800 text-white rounded-2xl shadow-lg p-5">
+                  {overview && overview.hasIncomeConfigured ? (
+                    <div className="flex flex-wrap items-center justify-between gap-6">
+                      <div className="flex flex-wrap gap-8">
+                        <Stat label="Monthly income" value={`$${overview.monthlyIncome.toFixed(2)}`} />
+                        <Stat label="Spent this month" value={`$${overview.spentThisMonth.toFixed(2)}`} />
+                        <Stat label="Saved this month" value={`$${overview.savedThisMonth.toFixed(2)}`} accent="text-mint" />
+                        <Stat
+                          label="Remaining"
+                          value={`$${overview.remaining.toFixed(2)}`}
+                          accent={overview.remaining >= 0 ? 'text-mint' : 'text-red-400'}
+                        />
                       <Stat label="Savings rate" value={overview.savingsRate !== null ? `${overview.savingsRate.toFixed(0)}%` : '—'} />
                       <Stat label="Net worth" value={`$${overview.totalSaved.toFixed(2)}`} accent="text-sky-400" />
                     </div>
@@ -417,71 +499,107 @@ export default function Dashboard({ user, profile }) {
                   </div>
                 )}
 
-                {showIncomeForm && (
-                  <form onSubmit={addIncome} className="flex flex-wrap gap-2 mt-4 pt-4 border-t border-white/10">
-                    <input
-                      placeholder="Amount"
-                      type="number"
-                      step="0.01"
-                      value={incomeForm.amount}
-                      onChange={e => setIncomeForm({ ...incomeForm, amount: e.target.value })}
-                      className="flex-1 min-w-[100px] rounded-lg px-3 py-2 text-navy focus:outline-none focus:ring-2 focus:ring-mint"
-                    />
-                    <select
-                      value={incomeForm.frequency}
-                      onChange={e => setIncomeForm({ ...incomeForm, frequency: e.target.value })}
-                      className="min-w-[120px] rounded-lg px-3 py-2 text-navy focus:outline-none focus:ring-2 focus:ring-mint"
+                <AnimatePresence>
+                  {showIncomeForm && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.25, ease: 'easeInOut' }}
+                      className="overflow-hidden"
                     >
-                      <option value="monthly">Monthly</option>
-                      <option value="biweekly">Biweekly</option>
-                    </select>
-                    <input
-                      type="date"
-                      value={incomeForm.effectiveDate}
-                      onChange={e => setIncomeForm({ ...incomeForm, effectiveDate: e.target.value })}
-                      className="flex-1 min-w-[140px] rounded-lg px-3 py-2 text-navy focus:outline-none focus:ring-2 focus:ring-mint"
-                    />
-                    <button
-                      type="submit"
-                      disabled={savingIncome}
-                      className="px-4 py-2 rounded-lg bg-mint text-navy font-medium hover:brightness-95 transition disabled:opacity-60"
-                    >
-                      {savingIncome ? 'Saving…' : 'Save'}
-                    </button>
-                  </form>
-                )}
-              </div>
+                      <form onSubmit={addIncome} className="flex flex-wrap items-center gap-2 mt-4 pt-4 border-t border-white/10">
+                        <input
+                          placeholder="Amount"
+                          type="number"
+                          step="0.01"
+                          value={incomeForm.amount}
+                          onChange={e => setIncomeForm({ ...incomeForm, amount: e.target.value })}
+                          className="flex-1 min-w-[100px] rounded-lg px-3 py-2 text-navy focus:outline-none focus:ring-2 focus:ring-mint"
+                        />
+                        <select
+                          value={incomeForm.frequency}
+                          onChange={e => setIncomeForm({ ...incomeForm, frequency: e.target.value })}
+                          className="min-w-[120px] rounded-lg px-3 py-2 text-navy focus:outline-none focus:ring-2 focus:ring-mint"
+                        >
+                          <option value="monthly">Monthly</option>
+                          <option value="biweekly">Biweekly</option>
+                        </select>
+                        <input
+                          type="date"
+                          value={incomeForm.effectiveDate}
+                          onChange={e => setIncomeForm({ ...incomeForm, effectiveDate: e.target.value })}
+                          className="flex-1 min-w-[140px] rounded-lg px-3 py-2 text-navy focus:outline-none focus:ring-2 focus:ring-mint"
+                        />
+                        {editingIncomeId && (
+                          <span className="text-xs text-amber-300 whitespace-nowrap">Editing entry</span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={cancelIncomeForm}
+                          className="px-4 py-2 rounded-lg border border-white/20 text-white text-sm font-medium hover:bg-white/10 transition"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={savingIncome}
+                          className="px-4 py-2 rounded-lg bg-mint text-navy font-medium hover:brightness-95 transition disabled:opacity-60"
+                        >
+                          {savingIncome ? 'Saving…' : editingIncomeId ? 'Update' : 'Save'}
+                        </button>
+                      </form>
 
-              {/* Tabs */}
-              <div className="flex gap-1 mt-4 -mb-px overflow-x-auto">
-                {TABS.map(tab => (
-                  <button
-                    key={tab.id}
-                    onClick={() => setActiveTab(tab.id)}
-                    className={`px-4 py-2 text-sm font-medium rounded-t-lg border-b-2 transition whitespace-nowrap ${
-                      activeTab === tab.id
-                        ? 'border-mint text-navy dark:text-mint'
-                        : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-navy dark:hover:text-gray-200'
-                    }`}
-                  >
-                    {tab.label}
-                  </button>
-                ))}
+                      {trend.length > 0 && (
+                        <div className="mt-4 pt-4 border-t border-white/10 max-h-56 overflow-y-auto">
+                          <p className="text-xs text-slate-400 mb-2">Monthly summary</p>
+                          <table className="w-full text-xs">
+                            <thead>
+                              <tr className="text-left text-slate-400 border-b border-white/10">
+                                <th className="pb-1.5 font-medium">Month</th>
+                                <th className="pb-1.5 font-medium">Income</th>
+                                <th className="pb-1.5 font-medium">Spent</th>
+                                <th className="pb-1.5 font-medium">Saved</th>
+                              </tr>
+                            </thead>
+                            <tbody className="font-mono">
+                              {[...trend].reverse().map(m => (
+                                <tr key={m.month} className="border-b border-white/5 hover:bg-white/5 transition-colors">
+                                  <td className="py-1.5 font-sans text-slate-300">{m.month}</td>
+                                  <td className="py-1.5 text-sky-400">${m.income.toFixed(2)}</td>
+                                  <td className="py-1.5 text-red-400">${m.spent.toFixed(2)}</td>
+                                  <td className="py-1.5 text-mint">${m.saved.toFixed(2)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
             </>
           )}
-        </div>
-      </div>
-
-      <div className="max-w-5xl mx-auto px-6 py-6">
-        {initialLoading ? (
-          <div className="flex flex-col gap-6">
-            <SkeletonCard lines={4} />
-            <SkeletonCard lines={5} />
           </div>
-        ) : (
-          <>
-            {/* Overview tab */}
+        </motion.div>
+
+        <div className="max-w-4xl mx-auto px-6 py-6">
+          {initialLoading ? (
+            <div className="flex flex-col gap-6">
+              <SkeletonCard lines={4} />
+              <SkeletonCard lines={5} />
+            </div>
+          ) : (
+            <AnimatePresence mode="wait">
+              <motion.div
+                key={activeTab}
+                initial={{ opacity: 0, y: 6 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -6 }}
+                transition={{ duration: 0.15, ease: 'easeOut' }}
+              >
+              {/* Overview tab */}
             {activeTab === 'overview' && (
               <Card title="Monthly Trend — Income vs. Spent vs. Saved">
                 {trend.some(m => m.income > 0 || m.spent > 0 || m.saved > 0) ? (
@@ -513,15 +631,30 @@ export default function Dashboard({ user, profile }) {
                           <th className="pb-1.5 font-medium">Amount</th>
                           <th className="pb-1.5 font-medium">Frequency</th>
                           <th className="pb-1.5 font-medium">Monthly equivalent</th>
+                          <th className="pb-1.5 font-medium"></th>
                         </tr>
                       </thead>
                       <tbody className="font-mono">
                         {incomeHistory.map(entry => (
-                          <tr key={entry.id} className="border-b border-gray-100 dark:border-gray-800">
+                          <tr key={entry.id} className="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/40 transition-colors">
                             <td className="py-1.5 font-sans">{entry.effectiveDate}</td>
                             <td className="py-1.5">${Number(entry.amount).toFixed(2)}</td>
                             <td className="py-1.5 capitalize font-sans">{entry.frequency}</td>
                             <td className="py-1.5">${(entry.frequency === 'biweekly' ? entry.amount * (26 / 12) : entry.amount).toFixed(2)}</td>
+                            <td className="py-1.5 font-sans text-right">
+                              <button
+                                onClick={() => { setActiveTab('overview'); startEditIncome(entry) }}
+                                className="text-slate-400 hover:text-navy dark:hover:text-mint transition mr-2"
+                              >
+                                Edit
+                              </button>
+                              <button
+                                onClick={() => deleteIncome(entry.id, entry.effectiveDate)}
+                                className="text-red-500 hover:text-red-700 transition"
+                              >
+                                ✕
+                              </button>
+                            </td>
                           </tr>
                         ))}
                       </tbody>
@@ -619,7 +752,7 @@ export default function Dashboard({ user, profile }) {
                         </tr>
                       </thead>
                       <tbody>
-                        {filteredTransactions.map(t => (
+                        {paginatedTransactions.map(t => (
                           <tr key={t.id} className="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/60 transition">
                             <td className="px-5 py-2 font-mono text-xs text-slate-500 dark:text-slate-400">{t.date}</td>
                             <td className="px-2 py-2 dark:text-gray-200">{t.description}</td>
@@ -644,18 +777,44 @@ export default function Dashboard({ user, profile }) {
                         )}
                       </tbody>
                     </table>
+                    {filteredTransactions.length > TRANSACTIONS_PER_PAGE && (
+                      <div className="flex justify-between items-center px-5 py-3 border-t border-gray-100 dark:border-gray-800 text-xs text-slate-500 dark:text-slate-400">
+                        <span>
+                          Showing {(pageSafe - 1) * TRANSACTIONS_PER_PAGE + 1}–{Math.min(pageSafe * TRANSACTIONS_PER_PAGE, filteredTransactions.length)} of {filteredTransactions.length}
+                        </span>
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                            disabled={pageSafe === 1}
+                            className="p-1.5 rounded-md border border-gray-300 dark:border-gray-700 disabled:opacity-30 disabled:cursor-default hover:bg-gray-50 dark:hover:bg-gray-800 transition"
+                          >
+                            <ChevronLeft className="w-3.5 h-3.5" />
+                          </button>
+                          <span className="px-2">Page {pageSafe} of {totalPages}</span>
+                          <button
+                            onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                            disabled={pageSafe === totalPages}
+                            className="p-1.5 rounded-md border border-gray-300 dark:border-gray-700 disabled:opacity-30 disabled:cursor-default hover:bg-gray-50 dark:hover:bg-gray-800 transition"
+                          >
+                            <ChevronRight className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </Card>
 
                   <Card title={`Spending by Category${selectedMonth !== 'All' ? ` — ${monthLabel(selectedMonth)}` : ''}`} className="flex-1 min-w-[320px]">
                     {chartData.length > 0 ? (
-                      <ResponsiveContainer width="100%" height={280}>
-                        <PieChart>
-                          <Pie data={chartData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={100} label>
-                            {chartData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-                          </Pie>
+                      <ResponsiveContainer width="100%" height={Math.max(200, chartData.length * 36)}>
+                        <BarChart data={chartData} layout="vertical" margin={{ left: 8, right: 24 }}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-gray-200 dark:text-gray-800" horizontal={false} />
+                          <XAxis type="number" fontSize={12} stroke="currentColor" className="text-slate-500 dark:text-slate-400" />
+                          <YAxis dataKey="name" type="category" width={110} fontSize={12} stroke="currentColor" className="text-slate-500 dark:text-slate-400" />
                           <Tooltip formatter={(value) => `$${Number(value).toFixed(2)}`} />
-                          <Legend />
-                        </PieChart>
+                          <Bar dataKey="value" radius={[0, 4, 4, 0]}>
+                            {chartData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+                          </Bar>
+                        </BarChart>
                       </ResponsiveContainer>
                     ) : (
                       <p className="text-slate-400 dark:text-slate-500 text-sm">{selectedMonth === 'All' ? 'Add transactions to see your breakdown.' : `No spending in ${monthLabel(selectedMonth)}.`}</p>
@@ -952,8 +1111,10 @@ export default function Dashboard({ user, profile }) {
                 </form>
               </Card>
             )}
-          </>
-        )}
+              </motion.div>
+            </AnimatePresence>
+          )}
+        </div>
       </div>
 
       <ConfirmDialog
@@ -989,7 +1150,7 @@ function Stat({ label, value, accent = 'text-white' }) {
 
 function Card({ title, headerRight, children, className = '', bodyClassName = 'p-5' }) {
   return (
-    <div className={`bg-white dark:bg-gray-900 rounded-2xl border border-gray-200 dark:border-gray-800 shadow-sm ${bodyClassName} ${className}`}>
+    <div className={`bg-white/85 dark:bg-gray-900/80 backdrop-blur-md rounded-2xl border border-gray-200 dark:border-gray-800 shadow-sm ${bodyClassName} ${className}`}>
       {title && (
         <div className="flex justify-between items-center mb-3">
           <h3 className="font-semibold text-navy dark:text-gray-100">{title}</h3>

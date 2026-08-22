@@ -126,7 +126,7 @@ async function requireAuth(req, res, next) {
 }
 
 // --- Groq helper (OpenAI-compatible chat completions API) ---
-async function callGroq(prompt, maxTokens = 300) {
+async function callGroq(prompt, maxTokens = 300, extraOptions = {}) {
   if (!groq) {
     throw new Error('GROQ_API_KEY is not set');
   }
@@ -134,7 +134,8 @@ async function callGroq(prompt, maxTokens = 300) {
   const completion = await groq.chat.completions.create({
     model: MODEL,
     messages: [{ role: 'user', content: prompt }],
-    max_tokens: maxTokens
+    max_tokens: maxTokens,
+    ...extraOptions
   });
 
   return (completion.choices?.[0]?.message?.content || '').trim();
@@ -178,17 +179,27 @@ Respond with ONLY valid JSON, no markdown fences, no explanation, in exactly thi
 // Splits extracted PDF text into manageable chunks for the AI to parse —
 // prefers splitting on page breaks (what pdf-parse inserts between pages),
 // falling back to a character-count split for PDFs with no page markers.
-// Capped so one huge statement can't trigger unbounded Groq calls.
+// Every chunk is then hard-capped in size regardless of source, since
+// Groq's free tier caps openai/gpt-oss-120b at 8000 tokens TOTAL per
+// request (input + output combined) — an oversized single page could
+// otherwise slip through the page-break path uncapped.
 const MAX_STATEMENT_CHUNKS = 8;
+const MAX_CHUNK_CHARS = 3500;
+
+function splitToMaxSize(str) {
+  const parts = [];
+  for (let i = 0; i < str.length; i += MAX_CHUNK_CHARS) {
+    parts.push(str.slice(i, i + MAX_CHUNK_CHARS));
+  }
+  return parts;
+}
+
 function chunkStatementText(text) {
   let pages = text.split('\f').map(p => p.trim()).filter(Boolean);
   if (pages.length <= 1) {
-    // No page breaks found — fall back to fixed-size chunks.
-    pages = [];
-    const CHUNK_SIZE = 6000;
-    for (let i = 0; i < text.length; i += CHUNK_SIZE) {
-      pages.push(text.slice(i, i + CHUNK_SIZE));
-    }
+    pages = splitToMaxSize(text); // no page markers — fall back to fixed-size chunks
+  } else {
+    pages = pages.flatMap(splitToMaxSize); // guard against any oversized individual page
   }
   const truncated = pages.length > MAX_STATEMENT_CHUNKS;
   return { chunks: pages.slice(0, MAX_STATEMENT_CHUNKS), truncated };
@@ -220,14 +231,20 @@ no transactions on this page, respond with an empty array. Exact shape:
 Statement text:
 ${chunkText}`;
 
+  let raw;
   try {
-    const raw = await callGroq(prompt, 4096); // statements can list many transactions — needs real room
+    // 4000 output tokens + a ~3500-char chunk (~1000-1500 input tokens) +
+    // prompt overhead stays comfortably under Groq's 8000-token combined cap.
+    raw = await callGroq(prompt, 4000, { reasoning_effort: 'low' });
     const cleaned = raw.replace(/```json|```/g, '').trim();
     const parsed = JSON.parse(cleaned);
     if (!Array.isArray(parsed)) return [];
     return parsed.filter(t => t.date && t.description && typeof t.amount === 'number' && (t.type === 'debit' || t.type === 'credit'));
   } catch (err) {
     console.error('Statement chunk parsing failed:', err.message);
+    if (typeof raw === 'string') {
+      console.error('[import-pdf] redacted raw AI response (first 500 chars):', raw.slice(0, 500).replace(/\d/g, '#'));
+    }
     return []; // skip a bad chunk rather than failing the whole import
   }
 }
@@ -420,6 +437,115 @@ async function renderPageWithSpacing(pageData) {
   return text;
 }
 
+// --- Known statement format templates ---
+// For statement layouts we've seen before, parse them deterministically —
+// no AI call needed, no token limits, no risk of a number being misread.
+// AI extraction (further below) is only used as a fallback for formats we
+// don't have a template for yet.
+
+const MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+
+function isScotiabankDayToDayStatement(text) {
+  // "Scotiabank" and "Day-to-Day Banking" in the header are part of a logo
+  // graphic, not real text — pdf-parse never sees them. These signals ARE
+  // genuinely present in the extracted text: the internal reference code
+  // format, the support phone number, and the transaction table headers.
+  const hasScotiabankMarker = /SBSAV\d/i.test(text) || /4-SCOTIA/i.test(text) || /472-6842/.test(text);
+  const hasTransactionTable = /withdrawn\s*\(\$\)/i.test(text) && /deposited\s*\(\$\)/i.test(text);
+  return hasScotiabankMarker && hasTransactionTable;
+}
+
+// Lines that are headers, footers, addresses, marketing blurbs, or other
+// non-transaction noise repeated on every page of this statement format.
+const SCOTIABANK_NOISE_PATTERNS = [
+  /^continued on next page$/i,
+  /^Page \d+ of \d+$/i,
+  /^Your account number:?$/i,
+  /^\d{5}\s+\d{5}\s+\d{2}$/,
+  /^Questions\?$/i,
+  /^Call /i,
+  /^For online account access:?$/i,
+  /^www\./i,
+  /^Here'?s what happened/i,
+  /^Date\s+Transactions/i,
+  /^Amounts$/i,
+  /^withdrawn/i,
+  /^deposited/i,
+  /^Balance/i,
+  /^MR |^MS |^MRS /,
+  /^Your .*account/i,
+  /^Opening Balance on/i,
+  /^Minus total/i,
+  /^Plus total/i,
+  /^Closing Balance on/i,
+  /^SBSAV/,
+  /^\*\d+\*$/,
+  /Scotiabank/i,
+  /Day-to-Day Banking/i,
+  /SQUARE ONE|MISSISSAUGA|CITY CENTRE DRIVE/i,
+  /Take steps towards|Scotia Insurance|scotiainsurance/i,
+  /^----\s*\|?$/
+];
+
+function parseScotiabankDayToDayStatement(text) {
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const isNoise = (line) => SCOTIABANK_NOISE_PATTERNS.some(re => re.test(line));
+
+  const yearMatch = text.match(/Opening Balance on \w+\s+\d{1,2},\s*(\d{4})/);
+  let year = yearMatch ? Number(yearMatch[1]) : new Date().getFullYear();
+  let prevMonthIndex = null;
+  let prevBalance = null;
+
+  const transactionLineRe = /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+(.*)$/;
+  const transactions = [];
+  let current = null;
+
+  for (const line of lines) {
+    if (isNoise(line)) continue;
+
+    const m = line.match(transactionLineRe);
+    if (m) {
+      if (current) transactions.push(current);
+      current = null;
+
+      const [, monName, dayStr, rest] = m;
+      const monthIndex = MONTHS[monName];
+      if (prevMonthIndex !== null && monthIndex < prevMonthIndex) year++; // crossed a year boundary
+      prevMonthIndex = monthIndex;
+
+      const date = `${year}-${String(monthIndex + 1).padStart(2, '0')}-${String(Number(dayStr)).padStart(2, '0')}`;
+      const numbers = (rest.match(/[\d,]+\.\d{2}/g) || []).map(n => Number(n.replace(/,/g, '')));
+      const description = rest.replace(/[\d,]+\.\d{2}/g, '').replace(/\s{2,}/g, ' ').trim();
+
+      if (numbers.length === 1) {
+        // Opening/Closing Balance line — no transaction, just a balance checkpoint.
+        prevBalance = numbers[0];
+        continue;
+      }
+      if (numbers.length < 2) continue;
+
+      const [amount, balance] = numbers;
+      // The deterministic signal: did the running balance go up or down?
+      const type = prevBalance === null
+        ? (/dep\.|deposit|transfer from/i.test(description) ? 'credit' : 'debit') // no reference yet — fall back to keywords
+        : (balance > prevBalance ? 'credit' : 'debit');
+      prevBalance = balance;
+
+      current = { date, description: description || 'Transaction', amount, type };
+    } else if (current) {
+      // A continuation line (merchant detail below the transaction row).
+      current.description = `${current.description} ${line}`.trim();
+    }
+  }
+  if (current) transactions.push(current);
+
+  return transactions;
+}
+
+const STATEMENT_TEMPLATES = [
+  { id: 'scotiabank-day-to-day', matches: isScotiabankDayToDayStatement, parse: parseScotiabankDayToDayStatement }
+];
+
 // --- PDF statement import ---
 // Step 1: upload a PDF, get back a PROPOSED list of transactions. Nothing
 // is saved yet — the frontend shows this list for the user to review, edit,
@@ -446,22 +572,39 @@ app.post('/api/transactions/import-pdf', requireAuth, upload.single('statement')
     });
   }
 
-  const currentYear = new Date().getFullYear();
-  const { chunks, truncated } = chunkStatementText(text);
-
-  // Diagnostic logging — metadata only, plus a REDACTED preview (all digits
-  // replaced with #) so you can see the text's structure/formatting without
-  // exposing real account numbers, balances, or amounts in your terminal.
-  console.log(`[import-pdf] extracted ${text.length} chars of text, split into ${chunks.length} chunk(s)`);
-  console.log('[import-pdf] redacted preview of first 300 chars:', text.slice(0, 300).replace(/\d/g, '#'));
-
-  // Process chunks sequentially (not in parallel) to stay well within
-  // Groq's free-tier rate limits on a single import.
   let extracted = [];
-  for (const [i, chunk] of chunks.entries()) {
-    const fromChunk = await extractTransactionsFromChunk(chunk, currentYear);
-    console.log(`[import-pdf] chunk ${i + 1}/${chunks.length}: ${chunk.length} chars in, ${fromChunk.length} transactions parsed out`);
-    extracted = extracted.concat(fromChunk);
+  let truncated = false;
+  let usedTemplate = null;
+
+  for (const template of STATEMENT_TEMPLATES) {
+    if (template.matches(text)) {
+      const parsedByTemplate = template.parse(text);
+      if (parsedByTemplate.length > 0) {
+        extracted = parsedByTemplate;
+        usedTemplate = template.id;
+      }
+      break; // first matching template wins, whether or not it found transactions
+    }
+  }
+
+  if (usedTemplate) {
+    console.log(`[import-pdf] matched known format "${usedTemplate}" — parsed deterministically, no AI call needed. ${extracted.length} transactions found.`);
+  } else {
+    // No known template matched — fall back to AI-based extraction.
+    const currentYear = new Date().getFullYear();
+    const chunkResult = chunkStatementText(text);
+    truncated = chunkResult.truncated;
+
+    console.log(`[import-pdf] no known format matched — using AI extraction. ${text.length} chars split into ${chunkResult.chunks.length} chunk(s)`);
+    console.log('[import-pdf] redacted preview of first 300 chars:', text.slice(0, 300).replace(/\d/g, '#'));
+
+    // Process chunks sequentially (not in parallel) to stay well within
+    // Groq's free-tier rate limits on a single import.
+    for (const [i, chunk] of chunkResult.chunks.entries()) {
+      const fromChunk = await extractTransactionsFromChunk(chunk, currentYear);
+      console.log(`[import-pdf] chunk ${i + 1}/${chunkResult.chunks.length}: ${chunk.length} chars in, ${fromChunk.length} transactions parsed out`);
+      extracted = extracted.concat(fromChunk);
+    }
   }
 
   if (extracted.length === 0) {
