@@ -1,10 +1,21 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import Groq from 'groq-sdk';
 import multer from 'multer';
 import pdfParse from 'pdf-parse';
 import { db, auth } from './firestore.js';
+import {
+  categoriesFor,
+  toMonthlyAmount,
+  incomeInEffectOn,
+  lastNMonths,
+  daysLeftInMonth,
+  advanceDate,
+  isScotiabankDayToDayStatement,
+  parseScotiabankDayToDayStatement,
+  chunkStatementText
+} from './lib.js';
+import { groq, callGroq, categorize } from './ai.js';
 
 dotenv.config();
 
@@ -20,72 +31,9 @@ const upload = multer({
 });
 
 const PORT = process.env.PORT || 8080;
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
-const MODEL = 'openai/gpt-oss-120b'; // free-tier eligible (llama-3.3-70b-versatile was deprecated Aug 2026)
-
-const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
-
-// Category sets change based on why someone's using the app — set during
-// onboarding. This is what makes the onboarding question actually matter,
-// rather than just being a label stored and never used again.
-const CATEGORY_SETS = {
-  self: ['Groceries', 'Dining', 'Transport', 'Rent/Housing', 'Utilities', 'Entertainment', 'Shopping', 'Health', 'Travel', 'Subscriptions', 'Other'],
-  business: ['Office Supplies', 'Client Meals', 'Software & Subscriptions', 'Business Travel', 'Marketing', 'Professional Services', 'Equipment', 'Rent/Utilities', 'Payroll', 'Other'],
-  other: ['Groceries', 'Dining', 'Transport', 'Bills', 'Entertainment', 'Shopping', 'Health', 'Travel', 'Subscriptions', 'Other']
-};
-
-function categoriesFor(purpose) {
-  return CATEGORY_SETS[purpose] || CATEGORY_SETS.self;
-}
+const VISION_MODEL = 'qwen/qwen3.6-27b'; // free-tier eligible, text + image input — used for receipt OCR
 
 const SAVINGS_TYPES = ['Savings', 'Investment', 'Retirement', 'Other'];
-
-// Converts any income entry to a monthly-equivalent amount.
-// Biweekly = 26 pay periods/year, so monthly equivalent = amount * 26 / 12.
-function toMonthlyAmount(amount, frequency) {
-  if (frequency === 'biweekly') return amount * (26 / 12);
-  return amount; // 'monthly'
-}
-
-// Given a list of income entries (each with amount, frequency, effectiveDate)
-// and a target date, finds the entry that was in effect on that date —
-// i.e. the most recent entry whose effectiveDate is on or before it.
-// This is what makes income "history" actually work: a raise you log today
-// doesn't retroactively change what your income was three months ago.
-function incomeInEffectOn(incomeEntries, targetDate) {
-  const applicable = incomeEntries
-    .filter(e => e.effectiveDate <= targetDate)
-    .sort((a, b) => (a.effectiveDate < b.effectiveDate ? 1 : -1));
-  return applicable[0] || null;
-}
-
-// Builds the last `count` months (oldest first) as { month: 'YYYY-MM',
-// lastDay: 'YYYY-MM-DD' } — the last day of each month is what we check
-// income/spending/saving against, so a mid-month raise still counts for
-// that whole month.
-function lastNMonths(count) {
-  const today = new Date();
-  const months = [];
-  for (let i = count - 1; i >= 0; i--) {
-    const d = new Date(today.getFullYear(), today.getMonth() - i, 1);
-    const year = d.getFullYear();
-    const month = d.getMonth() + 1;
-    const monthStr = `${year}-${String(month).padStart(2, '0')}`;
-    const lastDayNum = new Date(year, month, 0).getDate();
-    const lastDay = `${monthStr}-${String(lastDayNum).padStart(2, '0')}`;
-    months.push({ month: monthStr, lastDay });
-  }
-  return months;
-}
-
-// Advances a YYYY-MM-DD date by one period of the given recurring frequency.
-function advanceDate(dateStr, frequency) {
-  const d = new Date(dateStr + 'T00:00:00');
-  if (frequency === 'weekly') d.setDate(d.getDate() + 7);
-  else if (frequency === 'biweekly') d.setDate(d.getDate() + 14);
-  else d.setMonth(d.getMonth() + 1); // 'monthly'
-  return d.toISOString().slice(0, 10);
-}
 
 // --- Auth middleware: verifies the Firebase ID token sent from the frontend
 // and scopes every request to that user's own data. ---
@@ -117,28 +65,12 @@ async function requireAuth(req, res, next) {
     // it determines which category set this request should use.
     const profileSnap = await req.userDocRef.get();
     req.profile = profileSnap.exists ? profileSnap.data() : {};
-    req.categories = categoriesFor(req.profile.purpose);
+    req.categories = categoriesFor(req.profile.purpose, req.profile.customCategories || []);
 
     next();
   } catch (err) {
     res.status(401).json({ error: 'Invalid or expired token' });
   }
-}
-
-// --- Groq helper (OpenAI-compatible chat completions API) ---
-async function callGroq(prompt, maxTokens = 300, extraOptions = {}) {
-  if (!groq) {
-    throw new Error('GROQ_API_KEY is not set');
-  }
-
-  const completion = await groq.chat.completions.create({
-    model: MODEL,
-    messages: [{ role: 'user', content: prompt }],
-    max_tokens: maxTokens,
-    ...extraOptions
-  });
-
-  return (completion.choices?.[0]?.message?.content || '').trim();
 }
 
 // Parses a free-text phrase like "Starbucks 5.50 today" into structured
@@ -174,35 +106,6 @@ Respond with ONLY valid JSON, no markdown fences, no explanation, in exactly thi
   }
 
   return parsed;
-}
-
-// Splits extracted PDF text into manageable chunks for the AI to parse —
-// prefers splitting on page breaks (what pdf-parse inserts between pages),
-// falling back to a character-count split for PDFs with no page markers.
-// Every chunk is then hard-capped in size regardless of source, since
-// Groq's free tier caps openai/gpt-oss-120b at 8000 tokens TOTAL per
-// request (input + output combined) — an oversized single page could
-// otherwise slip through the page-break path uncapped.
-const MAX_STATEMENT_CHUNKS = 8;
-const MAX_CHUNK_CHARS = 3500;
-
-function splitToMaxSize(str) {
-  const parts = [];
-  for (let i = 0; i < str.length; i += MAX_CHUNK_CHARS) {
-    parts.push(str.slice(i, i + MAX_CHUNK_CHARS));
-  }
-  return parts;
-}
-
-function chunkStatementText(text) {
-  let pages = text.split('\f').map(p => p.trim()).filter(Boolean);
-  if (pages.length <= 1) {
-    pages = splitToMaxSize(text); // no page markers — fall back to fixed-size chunks
-  } else {
-    pages = pages.flatMap(splitToMaxSize); // guard against any oversized individual page
-  }
-  const truncated = pages.length > MAX_STATEMENT_CHUNKS;
-  return { chunks: pages.slice(0, MAX_STATEMENT_CHUNKS), truncated };
 }
 
 // Extracts transaction line items from one chunk of statement text. AI's
@@ -249,26 +152,6 @@ ${chunkText}`;
   }
 }
 
-async function categorize(description, amount, categories) {
-  if (!groq) return 'Other';
-
-  const prompt = `Categorize this bank transaction into exactly ONE of these categories: ${categories.join(', ')}
-
-Transaction description: "${description}"
-Amount: ${amount}
-
-Respond with ONLY the category name, nothing else.`;
-
-  try {
-    const result = (await callGroq(prompt)).trim();
-    const match = categories.find(c => c.toLowerCase() === result.toLowerCase());
-    return match || 'Other';
-  } catch (err) {
-    console.error('Categorization failed:', err.message);
-    return 'Other';
-  }
-}
-
 async function chatAboutFinances(question, transactionsSummary, incomeContext, savingsContext, historyContext) {
   if (!groq) {
     return "AI chat isn't configured yet — set GROQ_API_KEY on the backend.";
@@ -298,13 +181,6 @@ Question: ${question}`;
   } catch (err) {
     return `AI request failed: ${err.message}`;
   }
-}
-
-function daysLeftInMonth(today) {
-  const [year, month] = today.split('-').map(Number);
-  const lastDay = new Date(year, month, 0).getDate(); // day 0 of next month = last day of this month
-  const currentDay = Number(today.slice(8, 10));
-  return lastDay - currentDay;
 }
 
 // Deterministic math (percent spent, over/under) happens in code before this
@@ -341,12 +217,25 @@ Write a short, friendly 1-2 sentence nudge mentioning the most urgent one(s) by 
 app.get('/api/profile', requireAuth, async (req, res) => {
   res.json({
     displayName: req.profile.displayName || null,
-    purpose: req.profile.purpose || null
+    purpose: req.profile.purpose || null,
+    phoneNumber: req.profile.phoneNumber || '',
+    budgetNudgeThreshold: req.profile.budgetNudgeThreshold ?? 80,
+    customCategories: req.profile.customCategories || [],
+    photoURL: req.profile.photoURL || null,
+    avatarEmoji: req.profile.avatarEmoji || null,
+    photoGallery: req.profile.photoGallery || [],
+    employmentType: req.profile.employmentType || null,
+    jobTitle: req.profile.jobTitle || '',
+    financialGoal: req.profile.financialGoal || null,
+    householdId: req.profile.householdId || null
   });
 });
 
 app.post('/api/profile', requireAuth, async (req, res) => {
-  const { displayName, purpose } = req.body;
+  const {
+    displayName, purpose, phoneNumber, budgetNudgeThreshold, photoURL, avatarEmoji,
+    employmentType, jobTitle, financialGoal
+  } = req.body;
 
   if (!displayName || !displayName.trim()) {
     return res.status(400).json({ error: 'displayName is required' });
@@ -355,14 +244,142 @@ app.post('/api/profile', requireAuth, async (req, res) => {
     return res.status(400).json({ error: "purpose must be 'self', 'business', or 'other'" });
   }
 
-  await req.userDocRef.set({ displayName: displayName.trim(), purpose }, { merge: true });
-  res.status(200).json({ displayName: displayName.trim(), purpose });
+  const update = { displayName: displayName.trim(), purpose };
+
+  if (phoneNumber !== undefined) update.phoneNumber = phoneNumber.trim();
+  if (photoURL !== undefined) update.photoURL = photoURL;
+  if (avatarEmoji !== undefined) update.avatarEmoji = avatarEmoji; // short unicode string, e.g. "🐨"
+  if (employmentType !== undefined) update.employmentType = employmentType;
+  if (jobTitle !== undefined) update.jobTitle = jobTitle.trim();
+  if (financialGoal !== undefined) update.financialGoal = financialGoal;
+
+  if (budgetNudgeThreshold !== undefined) {
+    const threshold = Number(budgetNudgeThreshold);
+    if (isNaN(threshold) || threshold < 1 || threshold > 100) {
+      return res.status(400).json({ error: 'budgetNudgeThreshold must be a number between 1 and 100' });
+    }
+    update.budgetNudgeThreshold = threshold;
+  }
+
+  await req.userDocRef.set(update, { merge: true });
+  res.status(200).json(update);
+});
+
+// --- Photo gallery ---
+// A personal set of images (up to 10, resized/compressed client-side) you
+// can pick your active avatar from — separate from the single active
+// photoURL, which is just "whichever gallery image is currently selected."
+
+const MAX_GALLERY_SIZE = 10;
+
+app.post('/api/profile/gallery', requireAuth, async (req, res) => {
+  const { photoURL } = req.body;
+  if (!photoURL || typeof photoURL !== 'string') {
+    return res.status(400).json({ error: 'photoURL is required' });
+  }
+
+  const gallery = req.profile.photoGallery || [];
+  if (gallery.length >= MAX_GALLERY_SIZE) {
+    return res.status(400).json({ error: `You can only keep up to ${MAX_GALLERY_SIZE} images in your gallery — remove one first.` });
+  }
+
+  const updated = [...gallery, photoURL];
+  await req.userDocRef.set({ photoGallery: updated }, { merge: true });
+  res.status(201).json(updated);
+});
+
+app.delete('/api/profile/gallery/:index', requireAuth, async (req, res) => {
+  const index = Number(req.params.index);
+  const gallery = req.profile.photoGallery || [];
+  const updated = gallery.filter((_, i) => i !== index);
+
+  const update = { photoGallery: updated };
+  // If the image being removed was the active avatar, clear it too so we
+  // don't leave photoURL pointing at something no longer in the gallery.
+  if (gallery[index] === req.profile.photoURL) {
+    update.photoURL = null;
+  }
+
+  await req.userDocRef.set(update, { merge: true });
+  res.status(200).json(update);
+});
+
+// --- Data export & account deletion ---
+
+// Bundles up everything this user has stored, for download as a backup or
+// before deleting their account.
+app.get('/api/export', requireAuth, async (req, res) => {
+  const [txSnap, incomeSnap, savingsSnap, budgetsSnap, recurringSnap] = await Promise.all([
+    req.transactionsRef.get(),
+    req.incomeRef.get(),
+    req.savingsRef.get(),
+    req.budgetsRef.get(),
+    req.recurringRef.get()
+  ]);
+
+  res.json({
+    exportedAt: new Date().toISOString(),
+    profile: req.profile,
+    transactions: txSnap.docs.map(d => ({ id: d.id, ...d.data() })),
+    income: incomeSnap.docs.map(d => ({ id: d.id, ...d.data() })),
+    savings: savingsSnap.docs.map(d => ({ id: d.id, ...d.data() })),
+    budgets: budgetsSnap.docs.map(d => ({ category: d.id, ...d.data() })),
+    recurring: recurringSnap.docs.map(d => ({ id: d.id, ...d.data() }))
+  });
+});
+
+// Deletes every Firestore document this user owns. Does NOT delete the
+// Firebase Auth account itself — the frontend does that separately with the
+// Firebase client SDK, since that requires the user's live session.
+app.delete('/api/account', requireAuth, async (req, res) => {
+  const collections = [req.transactionsRef, req.incomeRef, req.savingsRef, req.budgetsRef, req.recurringRef, req.chatRef];
+
+  for (const ref of collections) {
+    const snapshot = await ref.get();
+    await Promise.all(snapshot.docs.map(doc => doc.ref.delete()));
+  }
+
+  await req.userDocRef.delete();
+  res.status(204).end();
 });
 
 // Lets the frontend build category dropdowns without hardcoding a list that
 // might not match what this particular user's purpose actually uses.
 app.get('/api/categories', requireAuth, (req, res) => {
   res.json(req.categories);
+});
+
+// --- Custom categories ---
+// Additive only — these sit on top of the preset list for your purpose
+// (self/business/other), rather than replacing it. Existing budgets/
+// transactions referencing preset categories can't be orphaned this way.
+
+app.get('/api/categories/custom', requireAuth, (req, res) => {
+  res.json(req.profile.customCategories || []);
+});
+
+app.post('/api/categories/custom', requireAuth, async (req, res) => {
+  const { category } = req.body;
+  if (!category || !category.trim()) {
+    return res.status(400).json({ error: 'category is required' });
+  }
+  const trimmed = category.trim();
+
+  const existingLower = req.categories.map(c => c.toLowerCase());
+  if (existingLower.includes(trimmed.toLowerCase())) {
+    return res.status(400).json({ error: 'That category already exists.' });
+  }
+
+  const updated = [...(req.profile.customCategories || []), trimmed];
+  await req.userDocRef.set({ customCategories: updated }, { merge: true });
+  res.status(201).json(updated);
+});
+
+app.delete('/api/categories/custom/:category', requireAuth, async (req, res) => {
+  const current = req.profile.customCategories || [];
+  const updated = current.filter(c => c.toLowerCase() !== req.params.category.toLowerCase());
+  await req.userDocRef.set({ customCategories: updated }, { merge: true });
+  res.status(200).json(updated);
 });
 
 app.get('/api/transactions', requireAuth, async (req, res) => {
@@ -442,105 +459,6 @@ async function renderPageWithSpacing(pageData) {
 // no AI call needed, no token limits, no risk of a number being misread.
 // AI extraction (further below) is only used as a fallback for formats we
 // don't have a template for yet.
-
-const MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
-
-function isScotiabankDayToDayStatement(text) {
-  // "Scotiabank" and "Day-to-Day Banking" in the header are part of a logo
-  // graphic, not real text — pdf-parse never sees them. These signals ARE
-  // genuinely present in the extracted text: the internal reference code
-  // format, the support phone number, and the transaction table headers.
-  const hasScotiabankMarker = /SBSAV\d/i.test(text) || /4-SCOTIA/i.test(text) || /472-6842/.test(text);
-  const hasTransactionTable = /withdrawn\s*\(\$\)/i.test(text) && /deposited\s*\(\$\)/i.test(text);
-  return hasScotiabankMarker && hasTransactionTable;
-}
-
-// Lines that are headers, footers, addresses, marketing blurbs, or other
-// non-transaction noise repeated on every page of this statement format.
-const SCOTIABANK_NOISE_PATTERNS = [
-  /^continued on next page$/i,
-  /^Page \d+ of \d+$/i,
-  /^Your account number:?$/i,
-  /^\d{5}\s+\d{5}\s+\d{2}$/,
-  /^Questions\?$/i,
-  /^Call /i,
-  /^For online account access:?$/i,
-  /^www\./i,
-  /^Here'?s what happened/i,
-  /^Date\s+Transactions/i,
-  /^Amounts$/i,
-  /^withdrawn/i,
-  /^deposited/i,
-  /^Balance/i,
-  /^MR |^MS |^MRS /,
-  /^Your .*account/i,
-  /^Opening Balance on/i,
-  /^Minus total/i,
-  /^Plus total/i,
-  /^Closing Balance on/i,
-  /^SBSAV/,
-  /^\*\d+\*$/,
-  /Scotiabank/i,
-  /Day-to-Day Banking/i,
-  /SQUARE ONE|MISSISSAUGA|CITY CENTRE DRIVE/i,
-  /Take steps towards|Scotia Insurance|scotiainsurance/i,
-  /^----\s*\|?$/
-];
-
-function parseScotiabankDayToDayStatement(text) {
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  const isNoise = (line) => SCOTIABANK_NOISE_PATTERNS.some(re => re.test(line));
-
-  const yearMatch = text.match(/Opening Balance on \w+\s+\d{1,2},\s*(\d{4})/);
-  let year = yearMatch ? Number(yearMatch[1]) : new Date().getFullYear();
-  let prevMonthIndex = null;
-  let prevBalance = null;
-
-  const transactionLineRe = /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+(.*)$/;
-  const transactions = [];
-  let current = null;
-
-  for (const line of lines) {
-    if (isNoise(line)) continue;
-
-    const m = line.match(transactionLineRe);
-    if (m) {
-      if (current) transactions.push(current);
-      current = null;
-
-      const [, monName, dayStr, rest] = m;
-      const monthIndex = MONTHS[monName];
-      if (prevMonthIndex !== null && monthIndex < prevMonthIndex) year++; // crossed a year boundary
-      prevMonthIndex = monthIndex;
-
-      const date = `${year}-${String(monthIndex + 1).padStart(2, '0')}-${String(Number(dayStr)).padStart(2, '0')}`;
-      const numbers = (rest.match(/[\d,]+\.\d{2}/g) || []).map(n => Number(n.replace(/,/g, '')));
-      const description = rest.replace(/[\d,]+\.\d{2}/g, '').replace(/\s{2,}/g, ' ').trim();
-
-      if (numbers.length === 1) {
-        // Opening/Closing Balance line — no transaction, just a balance checkpoint.
-        prevBalance = numbers[0];
-        continue;
-      }
-      if (numbers.length < 2) continue;
-
-      const [amount, balance] = numbers;
-      // The deterministic signal: did the running balance go up or down?
-      const type = prevBalance === null
-        ? (/dep\.|deposit|transfer from/i.test(description) ? 'credit' : 'debit') // no reference yet — fall back to keywords
-        : (balance > prevBalance ? 'credit' : 'debit');
-      prevBalance = balance;
-
-      current = { date, description: description || 'Transaction', amount, type };
-    } else if (current) {
-      // A continuation line (merchant detail below the transaction row).
-      current.description = `${current.description} ${line}`.trim();
-    }
-  }
-  if (current) transactions.push(current);
-
-  return transactions;
-}
 
 const STATEMENT_TEMPLATES = [
   { id: 'scotiabank-day-to-day', matches: isScotiabankDayToDayStatement, parse: parseScotiabankDayToDayStatement }
@@ -949,7 +867,8 @@ app.get('/api/budgets/progress', requireAuth, async (req, res) => {
   });
 
   const daysLeft = daysLeftInMonth(today);
-  const nearOrOver = progress.filter(b => b.percent >= 80);
+  const threshold = req.profile.budgetNudgeThreshold ?? 80;
+  const nearOrOver = progress.filter(b => b.percent >= threshold);
   const nudge = await generateBudgetNudge(nearOrOver, daysLeft);
 
   res.json({ budgets: progress, daysLeftInMonth: daysLeft, nudge });
@@ -1042,6 +961,414 @@ app.get('/api/trend', requireAuth, async (req, res) => {
   });
 
   res.json(trend);
+});
+
+// --- Spend prediction / what-if simulator ---
+// All projection math (category averages, net worth over time) happens
+// here in code — deterministic and auditable. The frontend runs sliders
+// against this same math client-side for instant feedback; AI is only
+// ever asked to narrate numbers that were already computed, never to do
+// the arithmetic itself.
+
+app.get('/api/predict/baseline', requireAuth, async (req, res) => {
+  const monthsBack = 3;
+  const cutoff = new Date();
+  cutoff.setMonth(cutoff.getMonth() - monthsBack);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+  const [txSnapshot, savingsSnapshot, incomeSnapshot] = await Promise.all([
+    req.transactionsRef.get(),
+    req.savingsRef.get(),
+    req.incomeRef.get()
+  ]);
+
+  const recentTx = txSnapshot.docs.map(d => d.data()).filter(t => t.date >= cutoffStr);
+  const categoryTotals = {};
+  recentTx.forEach(t => {
+    categoryTotals[t.category] = (categoryTotals[t.category] || 0) + t.amount;
+  });
+  const categoryAverages = {};
+  Object.entries(categoryTotals).forEach(([cat, total]) => {
+    categoryAverages[cat] = total / monthsBack;
+  });
+
+  const currentNetWorth = savingsSnapshot.docs.reduce((sum, d) => sum + d.data().amount, 0);
+
+  const today = new Date().toISOString().slice(0, 10);
+  const incomeEntries = incomeSnapshot.docs.map(d => d.data());
+  const activeIncome = incomeInEffectOn(incomeEntries, today);
+  const monthlyIncome = activeIncome ? toMonthlyAmount(activeIncome.amount, activeIncome.frequency) : 0;
+
+  res.json({ categoryAverages, currentNetWorth, monthlyIncome });
+});
+
+// Client already computed both the baseline and scenario final numbers
+// using the same deterministic formula — this endpoint's only job is
+// turning those two numbers into a plain-language sentence.
+app.post('/api/predict/narrate', requireAuth, async (req, res) => {
+  const { adjustments, incomeDeltaPercent, months, baselineFinal, scenarioFinal } = req.body;
+
+  if (!groq) {
+    return res.json({ narrative: "AI narration isn't configured — set GROQ_API_KEY on the backend." });
+  }
+
+  const adjustmentsText = (adjustments || [])
+    .filter(a => a.deltaAmount)
+    .map(a => `${a.category}: ${a.deltaAmount > 0 ? '+' : ''}$${a.deltaAmount}/month`)
+    .join(', ') || 'no category changes';
+  const incomeText = incomeDeltaPercent
+    ? `income changed by ${incomeDeltaPercent > 0 ? '+' : ''}${incomeDeltaPercent}%`
+    : 'no income change';
+
+  const prompt = `A user is exploring a what-if financial scenario over ${months} months.
+Adjustments: ${adjustmentsText}. ${incomeText}.
+Baseline projected net worth after ${months} months (no changes): $${Number(baselineFinal).toFixed(2)}.
+Scenario projected net worth after ${months} months (with the changes above): $${Number(scenarioFinal).toFixed(2)}.
+
+Write one or two short, plain-language sentences explaining what these numbers mean for the user.
+Use these exact numbers — do not recalculate or estimate anything yourself.`;
+
+  try {
+    const narrative = await callGroq(prompt, 300);
+    res.json({ narrative });
+  } catch (err) {
+    res.json({ narrative: null });
+  }
+});
+
+// --- Financial health score ---
+// Every component score is computed deterministically from real data.
+// AI's only job is a short encouragement + tip sentence at the end, using
+// the exact scores already calculated — never asked to grade anything itself.
+
+app.get('/api/health-score', requireAuth, async (req, res) => {
+  const months = lastNMonths(3);
+  const today = new Date().toISOString().slice(0, 10);
+  const currentMonth = today.slice(0, 7);
+
+  const [txSnapshot, incomeSnapshot, savingsSnapshot, budgetsSnapshot] = await Promise.all([
+    req.transactionsRef.get(),
+    req.incomeRef.get(),
+    req.savingsRef.get(),
+    req.budgetsRef.get()
+  ]);
+
+  const transactions = txSnapshot.docs.map(d => d.data());
+  const incomeEntries = incomeSnapshot.docs.map(d => d.data());
+  const savingsEntries = savingsSnapshot.docs.map(d => d.data());
+
+  // Spending consistency (0-30): lower month-to-month variance = higher score.
+  const monthlySpends = months.map(({ month }) =>
+    transactions.filter(t => t.date.startsWith(month)).reduce((s, t) => s + t.amount, 0)
+  );
+  const avgSpend = monthlySpends.reduce((s, v) => s + v, 0) / monthlySpends.length || 0;
+  const variance = monthlySpends.reduce((s, v) => s + Math.pow(v - avgSpend, 2), 0) / monthlySpends.length || 0;
+  const coefficientOfVariation = avgSpend > 0 ? Math.sqrt(variance) / avgSpend : 0;
+  const consistencyScore = Math.max(0, Math.min(30, 30 - coefficientOfVariation * 60));
+
+  // Savings rate (0-40): % of this month's income actually saved.
+  const activeIncome = incomeInEffectOn(incomeEntries, today);
+  const monthlyIncome = activeIncome ? toMonthlyAmount(activeIncome.amount, activeIncome.frequency) : 0;
+  const savedThisMonth = savingsEntries.filter(s => s.date.startsWith(currentMonth)).reduce((s, v) => s + v.amount, 0);
+  const savingsRate = monthlyIncome > 0 ? (savedThisMonth / monthlyIncome) * 100 : 0;
+  const savingsScore = Math.max(0, Math.min(40, (savingsRate / 30) * 40));
+
+  // Budget adherence (0-30): % of your set budgets you're staying within this month.
+  const budgetsList = budgetsSnapshot.docs.map(d => ({ category: d.id, limit: d.data().limit }));
+  let budgetScore = 15; // neutral default if no budgets are set yet
+  if (budgetsList.length > 0) {
+    const spentByCategory = {};
+    transactions.filter(t => t.date.startsWith(currentMonth)).forEach(t => {
+      spentByCategory[t.category] = (spentByCategory[t.category] || 0) + t.amount;
+    });
+    const withinBudget = budgetsList.filter(b => (spentByCategory[b.category] || 0) <= b.limit).length;
+    budgetScore = (withinBudget / budgetsList.length) * 30;
+  }
+
+  const score = Math.round(savingsScore + budgetScore + consistencyScore);
+  const grade = score >= 90 ? 'A' : score >= 75 ? 'B' : score >= 60 ? 'C' : score >= 40 ? 'D' : 'F';
+
+  let tip = null;
+  if (groq) {
+    const prompt = `A user's financial health score is ${score}/100 (grade ${grade}), made up of:
+- Savings rate: ${savingsScore.toFixed(0)}/40 (they saved ${savingsRate.toFixed(0)}% of income this month)
+- Budget adherence: ${budgetScore.toFixed(0)}/30
+- Spending consistency: ${consistencyScore.toFixed(0)}/30
+
+Write one short, encouraging sentence naming their strongest area, then one practical tip for
+their weakest area. Use only the numbers given — do not recalculate anything.`;
+    try {
+      tip = await callGroq(prompt, 200);
+    } catch (err) {
+      tip = null;
+    }
+  }
+
+  res.json({
+    score,
+    grade,
+    components: {
+      savingsRate: { score: Math.round(savingsScore), max: 40, value: Math.round(savingsRate) },
+      budgetAdherence: { score: Math.round(budgetScore), max: 30 },
+      consistency: { score: Math.round(consistencyScore), max: 30 }
+    },
+    tip
+  });
+});
+
+// --- Household mode (MVP) ---
+// Two-person shared spending view: invite by email, accept/decline, then
+// see a combined category breakdown and a 50/50 settle-up for the current
+// month. Deliberately scoped down from "merge everything" — budgets,
+// recurring transactions, income, and chat all stay private to each
+// person; only the read-only spending aggregate is shared.
+//
+// Security note: reading another member's transactionsRef only ever
+// happens after explicitly verifying, server-side, that both users are
+// confirmed members of the same household document — the Admin SDK can
+// read any user's data, so that verification step is what keeps this safe.
+
+app.post('/api/household/invite', requireAuth, async (req, res) => {
+  const { email } = req.body;
+  if (!email || !email.trim()) {
+    return res.status(400).json({ error: 'email is required' });
+  }
+  if (req.profile.householdId) {
+    return res.status(400).json({ error: "You're already in a household — leave it first to invite someone new." });
+  }
+
+  let targetUser;
+  try {
+    targetUser = await auth.getUserByEmail(email.trim());
+  } catch (err) {
+    return res.status(404).json({ error: 'No account found with that email.' });
+  }
+
+  if (targetUser.uid === req.uid) {
+    return res.status(400).json({ error: "You can't invite yourself." });
+  }
+
+  const inviteRef = await db.collection('householdInvites').add({
+    fromUid: req.uid,
+    fromEmail: req.profile.email || null,
+    fromName: req.profile.displayName || null,
+    toUid: targetUser.uid,
+    toEmail: targetUser.email,
+    status: 'pending',
+    createdAt: new Date().toISOString()
+  });
+
+  res.status(201).json({ id: inviteRef.id });
+});
+
+app.get('/api/household/invites', requireAuth, async (req, res) => {
+  const snapshot = await db.collection('householdInvites')
+    .where('toUid', '==', req.uid)
+    .where('status', '==', 'pending')
+    .get();
+  res.json(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
+});
+
+app.post('/api/household/invites/:id/accept', requireAuth, async (req, res) => {
+  const inviteRef = db.collection('householdInvites').doc(req.params.id);
+  const inviteSnap = await inviteRef.get();
+  if (!inviteSnap.exists) return res.status(404).json({ error: 'Invite not found' });
+
+  const invite = inviteSnap.data();
+  if (invite.toUid !== req.uid) return res.status(403).json({ error: 'Not your invite' });
+  if (invite.status !== 'pending') return res.status(400).json({ error: 'Invite already handled' });
+
+  const householdRef = await db.collection('households').add({
+    members: [invite.fromUid, invite.toUid],
+    createdAt: new Date().toISOString()
+  });
+
+  await Promise.all([
+    inviteRef.update({ status: 'accepted' }),
+    db.collection('users').doc(invite.fromUid).set({ householdId: householdRef.id }, { merge: true }),
+    db.collection('users').doc(invite.toUid).set({ householdId: householdRef.id }, { merge: true })
+  ]);
+
+  res.json({ householdId: householdRef.id });
+});
+
+app.post('/api/household/invites/:id/decline', requireAuth, async (req, res) => {
+  const inviteRef = db.collection('householdInvites').doc(req.params.id);
+  const inviteSnap = await inviteRef.get();
+  if (!inviteSnap.exists) return res.status(404).json({ error: 'Invite not found' });
+  if (inviteSnap.data().toUid !== req.uid) return res.status(403).json({ error: 'Not your invite' });
+
+  await inviteRef.update({ status: 'declined' });
+  res.status(204).end();
+});
+
+app.get('/api/household', requireAuth, async (req, res) => {
+  if (!req.profile.householdId) {
+    return res.json({ household: null });
+  }
+  const householdSnap = await db.collection('households').doc(req.profile.householdId).get();
+  if (!householdSnap.exists) {
+    return res.json({ household: null });
+  }
+  const { members } = householdSnap.data();
+  const memberInfo = await Promise.all(members.map(async uid => {
+    const [profileSnap, authUser] = await Promise.all([
+      db.collection('users').doc(uid).get(),
+      auth.getUser(uid).catch(() => null)
+    ]);
+    return {
+      uid,
+      displayName: profileSnap.data()?.displayName || authUser?.email || 'Member',
+      email: authUser?.email || null
+    };
+  }));
+
+  res.json({ household: { id: req.profile.householdId, members: memberInfo } });
+});
+
+app.delete('/api/household/leave', requireAuth, async (req, res) => {
+  if (!req.profile.householdId) {
+    return res.status(400).json({ error: 'Not in a household' });
+  }
+  const householdRef = db.collection('households').doc(req.profile.householdId);
+  const householdSnap = await householdRef.get();
+
+  if (householdSnap.exists) {
+    const { members } = householdSnap.data();
+    const otherMember = members.find(uid => uid !== req.uid);
+    await Promise.all([
+      householdRef.delete(),
+      db.collection('users').doc(req.uid).set({ householdId: null }, { merge: true }),
+      otherMember ? db.collection('users').doc(otherMember).set({ householdId: null }, { merge: true }) : Promise.resolve()
+    ]);
+  } else {
+    await db.collection('users').doc(req.uid).set({ householdId: null }, { merge: true });
+  }
+
+  res.status(204).end();
+});
+
+// Combined current-month category spending across both household members,
+// plus a simple 50/50 settle-up: who owes whom to make this month even.
+app.get('/api/household/spending', requireAuth, async (req, res) => {
+  if (!req.profile.householdId) {
+    return res.status(400).json({ error: 'Not in a household' });
+  }
+  const householdSnap = await db.collection('households').doc(req.profile.householdId).get();
+  if (!householdSnap.exists) {
+    return res.status(404).json({ error: 'Household not found' });
+  }
+  const { members } = householdSnap.data();
+  // Explicit membership check — this is what makes it safe to read another
+  // user's transactions with the Admin SDK below.
+  if (!members.includes(req.uid)) {
+    return res.status(403).json({ error: 'Not a member of this household' });
+  }
+
+  const currentMonth = new Date().toISOString().slice(0, 7);
+
+  const memberSpending = await Promise.all(members.map(async uid => {
+    const [profileSnap, txSnapshot] = await Promise.all([
+      db.collection('users').doc(uid).get(),
+      db.collection('users').doc(uid).collection('transactions').get()
+    ]);
+    const transactions = txSnapshot.docs.map(d => d.data()).filter(t => t.date.startsWith(currentMonth));
+    const total = transactions.reduce((sum, t) => sum + t.amount, 0);
+    const byCategory = {};
+    transactions.forEach(t => { byCategory[t.category] = (byCategory[t.category] || 0) + t.amount; });
+    return {
+      uid,
+      displayName: profileSnap.data()?.displayName || 'Member',
+      total,
+      byCategory
+    };
+  }));
+
+  const combinedTotal = memberSpending.reduce((sum, m) => sum + m.total, 0);
+  const fairShare = combinedTotal / memberSpending.length;
+
+  const settleUp = memberSpending.map(m => ({
+    uid: m.uid,
+    displayName: m.displayName,
+    spent: m.total,
+    balance: m.total - fairShare // positive = they overpaid, owed money; negative = they owe
+  }));
+
+  res.json({ memberSpending, combinedTotal, settleUp });
+});
+
+// --- Receipt OCR ---
+// Same "review before saving" philosophy as PDF import: AI extracts
+// proposed line items from a photo, nothing is saved until the user
+// reviews and confirms via the existing /api/transactions/import-confirm
+// route (shared with the PDF import flow — no new confirm endpoint needed).
+
+app.post('/api/transactions/receipt', requireAuth, upload.single('receipt'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded (expected field name "receipt")' });
+  }
+  if (!req.file.mimetype.startsWith('image/')) {
+    return res.status(400).json({ error: 'Only image files are supported' });
+  }
+  if (!groq) {
+    return res.status(503).json({ error: 'AI is not configured on the backend' });
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const base64Image = req.file.buffer.toString('base64');
+
+  const prompt = `Extract the transaction details from this receipt image. Identify the merchant
+name, the purchase date (YYYY-MM-DD format — if no date is visible, use ${today}), and every
+line item with its price. If tax is shown separately, include it as its own item named "Tax".
+
+Respond with ONLY valid JSON, no markdown fences, no explanation, in exactly this shape:
+{"merchant": "string", "date": "YYYY-MM-DD", "items": [{"description": "string", "amount": number}]}
+
+If you can't read any items clearly, respond with {"merchant": null, "date": "${today}", "items": []}`;
+
+  try {
+    const completion = await groq.chat.completions.create({
+      model: VISION_MODEL,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: prompt },
+          { type: 'image_url', image_url: { url: `data:${req.file.mimetype};base64,${base64Image}` } }
+        ]
+      }],
+      max_tokens: 2000
+    });
+
+    const raw = completion.choices?.[0]?.message?.content || '';
+    const cleaned = raw.replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(cleaned);
+
+    if (!parsed.items || !Array.isArray(parsed.items) || parsed.items.length === 0) {
+      return res.status(422).json({ error: "Couldn't find any items on that receipt — try a clearer photo." });
+    }
+
+    const existingSnapshot = await req.transactionsRef.get();
+    const existingKeys = new Set(
+      existingSnapshot.docs.map(doc => {
+        const t = doc.data();
+        return `${t.date}|${t.amount.toFixed(2)}`;
+      })
+    );
+
+    const proposed = [];
+    for (const item of parsed.items) {
+      if (!item.description || typeof item.amount !== 'number') continue;
+      const description = parsed.merchant ? `${item.description} (${parsed.merchant})` : item.description;
+      const category = await categorize(description, item.amount, req.categories);
+      const isDuplicate = existingKeys.has(`${parsed.date}|${item.amount.toFixed(2)}`);
+      proposed.push({ date: parsed.date, description, amount: item.amount, category, isDuplicate, type: 'debit' });
+    }
+
+    res.json({ merchant: parsed.merchant || null, transactions: proposed });
+  } catch (err) {
+    console.error('Receipt OCR failed:', err.message);
+    res.status(422).json({ error: "Couldn't read that receipt — try a clearer, well-lit photo." });
+  }
 });
 
 // Catches multer errors (e.g. file too large) so they return a clean JSON

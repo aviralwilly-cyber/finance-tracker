@@ -3,7 +3,7 @@ import { LogOut, Menu } from 'lucide-react'
 import { motion } from 'framer-motion'
 import MoneyBagIcon from './MoneyBagIcon'
 
-export default function Sidebar({ tabs, activeTab, setActiveTab, userEmail, onLogout }) {
+export default function Sidebar({ tabs, activeTab, setActiveTab, userEmail, userName, photoURL, avatarEmoji, onLogout }) {
   const [collapsed, setCollapsed] = useState(() => {
     if (typeof window === 'undefined') return false
     return localStorage.getItem('sidebarCollapsed') === 'true'
@@ -64,9 +64,22 @@ export default function Sidebar({ tabs, activeTab, setActiveTab, userEmail, onLo
         ))}
       </nav>
 
-      <div className="p-4 border-t border-gray-200 dark:border-gray-800">
-        {!collapsed && <p className="text-xs text-slate-400 truncate mb-2 px-2">{userEmail}</p>}
+      <div className={`p-4 border-t border-gray-200 dark:border-gray-800 flex ${collapsed ? 'flex-col items-center gap-2' : 'items-center gap-2'}`}>
+        {photoURL ? (
+          <img src={photoURL} alt="" className="w-8 h-8 rounded-full object-cover shrink-0" />
+        ) : avatarEmoji ? (
+          <div className="w-8 h-8 rounded-full bg-gray-100 dark:bg-gray-800 flex items-center justify-center text-base shrink-0">
+            {avatarEmoji}
+          </div>
+        ) : (
+          <div className="w-8 h-8 rounded-full bg-navy dark:bg-mint text-white dark:text-navy flex items-center justify-center text-xs font-semibold shrink-0">
+            {(userName || userEmail || '?').charAt(0).toUpperCase()}
+          </div>
+        )}
+        {!collapsed && <p className="text-xs text-slate-400 truncate flex-1">{userEmail}</p>}
+      </div>
 
+      <div className="p-4 border-t border-gray-200 dark:border-gray-800">
         <button
           onClick={onLogout}
           title={collapsed ? 'Log out' : undefined}

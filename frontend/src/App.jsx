@@ -38,5 +38,5 @@ export default function App() {
 
   if (!user) return <Login />
   if (!profile?.displayName) return <Onboarding onComplete={setProfile} />
-  return <Dashboard user={user} profile={profile} />
+  return <Dashboard key={user.uid} user={user} profile={profile} setProfile={setProfile} />
 }

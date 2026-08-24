@@ -1,0 +1,11 @@
+{
+  "name": "finance-tracker",
+  "private": true,
+  "description": "Run 'npm install' once here, then 'npm run dev' to start both the backend (auto-restarting on save) and frontend together.",
+  "scripts": {
+    "dev": "concurrently -n backend,frontend -c blue,green \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.1"
+  }
+}
