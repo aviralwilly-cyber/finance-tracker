@@ -1,0 +1,23 @@
+rules_version = '2';
+
+// This app's browser client never talks to Firestore directly — every read
+// and write goes through the Express backend (Firebase Admin SDK), which
+// verifies the user's Auth token itself and enforces authorization logic
+// explicitly in code (e.g. scoping every query to users/{uid}, or checking
+// household membership before a cross-user read).
+//
+// The Admin SDK bypasses these rules entirely by design, so denying all
+// direct client access here doesn't break the app — it closes the door
+// that would otherwise let someone with a valid Auth token query Firestore
+// directly from the browser and bypass the backend's authorization logic
+// (e.g. reading another user's transactions without a household check).
+//
+// See README.md "Security model" for the full threat model.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

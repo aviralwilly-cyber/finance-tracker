@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend, BarChart, Bar, XAxis, YAxis, CartesianGrid } from 'recharts'
+import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend, BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid } from 'recharts'
 import { signOut } from 'firebase/auth'
-import { Mic, Upload, ChevronLeft, ChevronRight, LayoutDashboard, Receipt, PiggyBank, Wallet, MessageCircle } from 'lucide-react'
+import { Mic, Upload, Camera, TrendingUp, Users, ChevronLeft, ChevronRight, LayoutDashboard, Receipt, PiggyBank, Wallet, MessageCircle, Settings as SettingsIcon } from 'lucide-react'
 import { auth } from './firebase'
 import { authedFetch } from './api'
 import ConfirmDialog from './ConfirmDialog'
@@ -10,25 +10,60 @@ import { useToasts, ToastContainer } from './Toast'
 import CategoryIcon from './CategoryIcon'
 import { SkeletonCard } from './Skeleton'
 import ImportWizard from './ImportWizard'
+import ReceiptWizard from './ReceiptWizard'
 import Sidebar from './Sidebar'
 import Lightfall from './Lightfall'
+import Settings from './Settings'
+import HealthScore from './HealthScore'
 
 const COLORS = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#06b6d4', '#a855f7', '#ec4899', '#84cc16', '#f97316', '#14b8a6', '#64748b']
 const SAVINGS_COLORS = ['#4ade80', '#60a5fa', '#facc15', '#a78bfa']
-const TABS = [
+
+// Fixed identity (id + icon) for every tab — only order and display label
+// are customizable, via Settings → Navigation.
+const BASE_TABS = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
   { id: 'transactions', label: 'Transactions', icon: Receipt },
   { id: 'savings', label: 'Savings', icon: PiggyBank },
   { id: 'budgets', label: 'Budgets', icon: Wallet },
-  { id: 'chat', label: 'Chat', icon: MessageCircle }
+  { id: 'predict', label: 'Predict', icon: TrendingUp },
+  { id: 'household', label: 'Household', icon: Users },
+  { id: 'chat', label: 'Chat', icon: MessageCircle },
+  { id: 'settings', label: 'Settings', icon: SettingsIcon }
 ]
 
-export default function Dashboard({ user, profile }) {
+// Reads any saved custom order/labels from localStorage and applies them on
+// top of BASE_TABS. Falls back gracefully to defaults if nothing's saved,
+// and stays forward-compatible if a future BASE_TABS entry isn't in an
+// older saved order yet (it just gets appended at the end).
+function loadTabs() {
+  const byId = Object.fromEntries(BASE_TABS.map(t => [t.id, t]))
+  let order = BASE_TABS.map(t => t.id)
+  let labels = {}
+  try {
+    const savedOrder = JSON.parse(localStorage.getItem('tabOrder') || 'null')
+    if (Array.isArray(savedOrder)) order = savedOrder.filter(id => byId[id])
+    const savedLabels = JSON.parse(localStorage.getItem('tabLabels') || 'null')
+    if (savedLabels && typeof savedLabels === 'object') labels = savedLabels
+  } catch {
+    // malformed localStorage — just use defaults
+  }
+  const missing = BASE_TABS.map(t => t.id).filter(id => !order.includes(id))
+  return [...order, ...missing].map(id => ({
+    id,
+    label: labels[id] || byId[id].label,
+    icon: byId[id].icon
+  }))
+}
+
+export default function Dashboard({ user, profile, setProfile }) {
   const { toasts, showToast } = useToasts()
+  const [tabs, setTabs] = useState(loadTabs)
   const [categories, setCategories] = useState([])
   const [confirmState, setConfirmState] = useState(null) // { message, onConfirm } | null
-  const [activeTab, setActiveTab] = useState('overview')
+  const [activeTab, setActiveTab] = useState(() => localStorage.getItem('defaultTab') || 'overview')
   const [initialLoading, setInitialLoading] = useState(true)
+  const backgroundEnabled = localStorage.getItem('backgroundEnabled') !== 'false'
 
   // "Hide on scroll" for the overview header, using the same core technique
   // HeroUI's Navbar uses: animating only transform/opacity, both compositor-
@@ -92,12 +127,13 @@ export default function Dashboard({ user, profile }) {
   const [trend, setTrend] = useState([])
   const [selectedMonth, setSelectedMonth] = useState('All')
   const [listening, setListening] = useState(false)
+  const [listeningQuickAdd, setListeningQuickAdd] = useState(false)
   const [nudgeDismissed, setNudgeDismissed] = useState(false)
 
   const [searchText, setSearchText] = useState('')
   const [categoryFilter, setCategoryFilter] = useState('All')
   const [currentPage, setCurrentPage] = useState(1)
-  const TRANSACTIONS_PER_PAGE = 10
+  const TRANSACTIONS_PER_PAGE = Number(localStorage.getItem('transactionsPerPage')) || 10
 
   const [recurring, setRecurring] = useState([])
   const [showRecurringForm, setShowRecurringForm] = useState(false)
@@ -108,13 +144,92 @@ export default function Dashboard({ user, profile }) {
   const [quickAdding, setQuickAdding] = useState(false)
 
   const [showImportWizard, setShowImportWizard] = useState(false)
+  const [showReceiptWizard, setShowReceiptWizard] = useState(false)
+
+  // --- Spend prediction / what-if simulator ---
+  const [predictBaseline, setPredictBaseline] = useState(null) // { categoryAverages, currentNetWorth, monthlyIncome }
+  const [predictAdjustments, setPredictAdjustments] = useState({}) // { category: deltaAmount }
+  const [predictIncomeDelta, setPredictIncomeDelta] = useState(0) // percent
+  const [predictMonths, setPredictMonths] = useState(6)
+  const [predictNarrative, setPredictNarrative] = useState(null)
+  const [narrating, setNarrating] = useState(false)
+
+  // --- Financial health score ---
+  const [healthScore, setHealthScore] = useState(null)
+
+  // --- Household mode ---
+  const [household, setHousehold] = useState(null) // { id, members: [{uid, displayName, email}] } | null
+  const [householdInvites, setHouseholdInvites] = useState([]) // pending invites addressed to me
+  const [householdSpending, setHouseholdSpending] = useState(null)
+
+  const loadHousehold = async () => {
+    const [houseRes, invitesRes] = await Promise.all([
+      authedFetch('/household'),
+      authedFetch('/household/invites')
+    ])
+    const houseData = await houseRes.json()
+    setHousehold(houseData.household)
+    setHouseholdInvites(await invitesRes.json())
+
+    if (houseData.household) {
+      const spendRes = await authedFetch('/household/spending')
+      setHouseholdSpending(await spendRes.json())
+    } else {
+      setHouseholdSpending(null)
+    }
+  }
+
+  const [inviteEmail, setInviteEmail] = useState('')
+  const [sendingInvite, setSendingInvite] = useState(false)
+
+  const sendHouseholdInvite = async (e) => {
+    e.preventDefault()
+    if (!inviteEmail.trim()) return
+    setSendingInvite(true)
+    const res = await authedFetch('/household/invite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: inviteEmail.trim() })
+    })
+    setSendingInvite(false)
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      showToast(data.error || "Couldn't send that invite", 'error')
+      return
+    }
+    setInviteEmail('')
+    showToast('Invite sent')
+  }
+
+  const acceptHouseholdInvite = async (id) => {
+    await authedFetch(`/household/invites/${id}/accept`, { method: 'POST' })
+    await loadHousehold()
+    showToast('Joined household')
+  }
+
+  const declineHouseholdInvite = async (id) => {
+    await authedFetch(`/household/invites/${id}/decline`, { method: 'POST' })
+    await loadHousehold()
+  }
+
+  const leaveHousehold = () => {
+    setConfirmState({
+      message: "Leave this household? You'll stop seeing each other's shared spending view.",
+      onConfirm: async () => {
+        await authedFetch('/household/leave', { method: 'DELETE' })
+        setConfirmState(null)
+        await loadHousehold()
+        showToast('Left household')
+      }
+    })
+  }
 
   const loadData = async () => {
     // Catch up any due recurring transactions first, so they're already
     // reflected in the transactions list this same load.
     await authedFetch('/recurring/process', { method: 'POST' })
 
-    const [txRes, sumRes, overviewRes, incomeRes, savingsRes, savingsSumRes, budgetsRes, trendRes, historyRes, categoriesRes, recurringRes] = await Promise.all([
+    const [txRes, sumRes, overviewRes, incomeRes, savingsRes, savingsSumRes, budgetsRes, trendRes, historyRes, categoriesRes, recurringRes, predictRes, healthRes] = await Promise.all([
       authedFetch('/transactions'),
       authedFetch('/transactions/summary'),
       authedFetch('/overview'),
@@ -125,7 +240,9 @@ export default function Dashboard({ user, profile }) {
       authedFetch('/trend'),
       authedFetch('/chat/history'),
       authedFetch('/categories'),
-      authedFetch('/recurring')
+      authedFetch('/recurring'),
+      authedFetch('/predict/baseline'),
+      authedFetch('/health-score')
     ])
     setTransactions(await txRes.json())
     setSummary(await sumRes.json())
@@ -143,6 +260,20 @@ export default function Dashboard({ user, profile }) {
     setDaysLeftInMonth(budgetsData.daysLeftInMonth ?? null)
     setTrend(await trendRes.json())
 
+    try {
+      setPredictBaseline(await predictRes.json())
+    } catch (err) {
+      console.error('Failed to load /predict/baseline:', err)
+      setPredictBaseline(null)
+    }
+
+    try {
+      setHealthScore(await healthRes.json())
+    } catch (err) {
+      console.error('Failed to load /health-score:', err)
+      setHealthScore(null)
+    }
+
     const fetchedCategories = await categoriesRes.json()
     setCategories(fetchedCategories)
     setBudgetForm(f => f.category ? f : { ...f, category: fetchedCategories[0] })
@@ -156,6 +287,12 @@ export default function Dashboard({ user, profile }) {
       { role: 'ai', text: h.answer }
     ])
     setChatLog(flattened)
+
+    try {
+      await loadHousehold()
+    } catch (err) {
+      console.error('Failed to load household data:', err)
+    }
   }
 
   useEffect(() => {
@@ -345,7 +482,7 @@ export default function Dashboard({ user, profile }) {
     showToast('Chat cleared')
   }
 
-  const startListening = () => {
+  const startVoiceInput = (setText, setListeningFlag) => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
     if (!SpeechRecognition) {
       alert('Speech recognition isn\'t supported in this browser — try Chrome or Edge.')
@@ -357,12 +494,12 @@ export default function Dashboard({ user, profile }) {
     recognition.maxAlternatives = 1
     recognition.onresult = (event) => {
       const transcript = event.results[0][0].transcript
-      setQuestion(prev => (prev ? prev + ' ' : '') + transcript)
+      setText(prev => (prev ? prev + ' ' : '') + transcript)
     }
-    recognition.onend = () => setListening(false)
-    recognition.onerror = () => setListening(false)
+    recognition.onend = () => setListeningFlag(false)
+    recognition.onerror = () => setListeningFlag(false)
     recognition.start()
-    setListening(true)
+    setListeningFlag(true)
   }
 
   const askAi = async (e) => {
@@ -410,34 +547,100 @@ export default function Dashboard({ user, profile }) {
   ).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value)
   const savingsChartData = Object.entries(savingsSummary).map(([name, value]) => ({ name, value }))
 
+  // Top categories by average spend — what the sliders let you adjust.
+  const topPredictCategories = predictBaseline
+    ? Object.entries(predictBaseline.categoryAverages).sort((a, b) => b[1] - a[1]).slice(0, 6)
+    : []
+
+  // Deterministic month-by-month net worth projection — this is the only
+  // place the "prediction" math happens. Baseline uses today's real
+  // averages/income unchanged; scenario applies whatever the sliders are
+  // currently set to. AI is never involved in computing these numbers —
+  // see the /predict/narrate call below, which only narrates the two
+  // final totals this produces.
+  const projection = useMemo(() => {
+    if (!predictBaseline) return { baseline: [], scenario: [], baselineFinal: 0, scenarioFinal: 0 }
+
+    const { categoryAverages, currentNetWorth, monthlyIncome } = predictBaseline
+    const baselineMonthlySpend = Object.values(categoryAverages).reduce((sum, v) => sum + v, 0)
+
+    const adjustmentTotal = Object.values(predictAdjustments).reduce((sum, v) => sum + (Number(v) || 0), 0)
+    const scenarioMonthlySpend = Math.max(0, baselineMonthlySpend + adjustmentTotal)
+    const scenarioMonthlyIncome = monthlyIncome * (1 + predictIncomeDelta / 100)
+
+    const baseline = []
+    const scenario = []
+    for (let m = 0; m <= predictMonths; m++) {
+      baseline.push({ month: `M${m}`, netWorth: currentNetWorth + m * (monthlyIncome - baselineMonthlySpend) })
+      scenario.push({ month: `M${m}`, netWorth: currentNetWorth + m * (scenarioMonthlyIncome - scenarioMonthlySpend) })
+    }
+
+    return {
+      baseline,
+      scenario,
+      baselineFinal: baseline[baseline.length - 1].netWorth,
+      scenarioFinal: scenario[scenario.length - 1].netWorth
+    }
+  }, [predictBaseline, predictAdjustments, predictIncomeDelta, predictMonths])
+
+  const predictChartData = projection.baseline.map((b, i) => ({
+    month: b.month,
+    baseline: b.netWorth,
+    scenario: projection.scenario[i]?.netWorth
+  }))
+
+  const getNarrative = async () => {
+    setNarrating(true)
+    const res = await authedFetch('/predict/narrate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        adjustments: Object.entries(predictAdjustments).map(([category, deltaAmount]) => ({ category, deltaAmount })),
+        incomeDeltaPercent: predictIncomeDelta,
+        months: predictMonths,
+        baselineFinal: projection.baselineFinal,
+        scenarioFinal: projection.scenarioFinal
+      })
+    })
+    const data = await res.json()
+    setPredictNarrative(data.narrative)
+    setNarrating(false)
+  }
+
   return (
     <div className="min-h-screen transition-colors flex relative">
       {/* Ambient background — sits behind everything; toned down vs. the login
           screen (fewer streaks, lower opacity, no mouse interaction) so it
-          stays a subtle backdrop and doesn't compete with the data. */}
-      <div className="fixed inset-0 z-0 pointer-events-none opacity-40 dark:opacity-60">
-        <Lightfall
-          colors={['#64ffda', '#8892b0', '#112240']}
-          backgroundColor="#0a192f"
-          speed={0.3}
-          streakCount={1}
-          streakWidth={1}
-          streakLength={1}
-          glow={0.7}
-          density={0.5}
-          twinkle={0.6}
-          zoom={3}
-          backgroundGlow={0.3}
-          opacity={1}
-          mouseInteraction={false}
-        />
-      </div>
+          stays a subtle backdrop and doesn't compete with the data. Can be
+          turned off in Settings for older devices / performance. */}
+      {backgroundEnabled && (
+        <div className="fixed inset-0 z-0 pointer-events-none opacity-40 dark:opacity-60">
+          <Lightfall
+            colors={['#64ffda', '#8892b0', '#112240']}
+            backgroundColor="#0a192f"
+            speed={0.3}
+            streakCount={1}
+            streakWidth={1}
+            streakLength={1}
+            glow={0.7}
+            density={0.5}
+            twinkle={0.6}
+            zoom={3}
+            backgroundGlow={0.3}
+            opacity={1}
+            mouseInteraction={false}
+          />
+        </div>
+      )}
 
       <Sidebar
-        tabs={TABS}
+        tabs={tabs}
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         userEmail={user.email}
+        userName={profile?.displayName}
+        photoURL={profile?.photoURL}
+        avatarEmoji={profile?.avatarEmoji}
         onLogout={() => signOut(auth)}
       />
 
@@ -601,7 +804,13 @@ export default function Dashboard({ user, profile }) {
               >
               {/* Overview tab */}
             {activeTab === 'overview' && (
-              <Card title="Monthly Trend — Income vs. Spent vs. Saved">
+              <div className="flex flex-col gap-6">
+                {healthScore && (
+                  <Card title="Financial Health Score" description="A snapshot of savings rate, budget adherence, and spending consistency — recalculated every time you load the app.">
+                    <HealthScore data={healthScore} />
+                  </Card>
+                )}
+                <Card title="Monthly Trend — Income vs. Spent vs. Saved">
                 {trend.some(m => m.income > 0 || m.spent > 0 || m.saved > 0) ? (
                   <ResponsiveContainer width="100%" height={280}>
                     <BarChart data={trend}>
@@ -662,6 +871,7 @@ export default function Dashboard({ user, profile }) {
                   </details>
                 )}
               </Card>
+              </div>
             )}
 
             {/* Transactions tab */}
@@ -700,6 +910,16 @@ export default function Dashboard({ user, profile }) {
                     onChange={e => setQuickAddText(e.target.value)}
                     className="flex-1 min-w-[240px] rounded-lg border border-dashed border-gray-300 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-mint focus:border-mint"
                   />
+                  <button
+                    type="button"
+                    onClick={() => startVoiceInput(setQuickAddText, setListeningQuickAdd)}
+                    title="Speak your transaction"
+                    className={`px-3 py-2 rounded-lg text-sm transition flex items-center ${
+                      listeningQuickAdd ? 'bg-red-500 text-white' : 'bg-gray-100 dark:bg-gray-800 text-navy dark:text-gray-200 hover:bg-gray-200 dark:hover:bg-gray-700'
+                    }`}
+                  >
+                    {listeningQuickAdd ? '● Listening…' : <Mic className="w-4 h-4" />}
+                  </button>
                   <button type="submit" disabled={quickAdding} className="btn-primary">
                     {quickAdding ? 'Parsing…' : 'Quick add'}
                   </button>
@@ -709,6 +929,13 @@ export default function Dashboard({ user, profile }) {
                     className="flex items-center gap-1.5 px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-700 text-sm text-navy dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-800 transition"
                   >
                     <Upload className="w-4 h-4" /> Import statement
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowReceiptWizard(true)}
+                    className="flex items-center gap-1.5 px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-700 text-sm text-navy dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-800 transition"
+                  >
+                    <Camera className="w-4 h-4" /> Scan receipt
                   </button>
                 </form>
 
@@ -1036,7 +1263,7 @@ export default function Dashboard({ user, profile }) {
                     {budgetProgress.map(b => {
                       const pct = Math.min(b.percent, 100)
                       const over = b.percent >= 100
-                      const near = b.percent >= 80 && !over
+                      const near = b.percent >= (profile?.budgetNudgeThreshold ?? 80) && !over
                       const barColor = over ? 'bg-red-500' : near ? 'bg-amber-500' : 'bg-emerald-500'
                       return (
                         <div key={b.category}>
@@ -1062,6 +1289,218 @@ export default function Dashboard({ user, profile }) {
                   </div>
                 )}
               </Card>
+            )}
+
+            {/* Predict tab — what-if simulator */}
+            {activeTab === 'predict' && (
+              <div className="flex flex-col gap-6">
+                <Card title="What-If Simulator" description="Adjust spending or income and see the projected impact on your net worth. All numbers are calculated deterministically — AI only explains the result, never computes it.">
+                  {!predictBaseline || topPredictCategories.length === 0 ? (
+                    <p className="text-slate-400 dark:text-slate-500 text-sm">
+                      Log a few months of transactions to unlock projections based on your real spending averages.
+                    </p>
+                  ) : (
+                    <>
+                      <div className="flex flex-wrap gap-2 mb-5">
+                        {[3, 6, 12].map(m => (
+                          <button
+                            key={m}
+                            onClick={() => setPredictMonths(m)}
+                            className={`px-3 py-1.5 rounded-lg text-sm font-medium border transition ${
+                              predictMonths === m ? 'border-mint bg-mint/10 text-navy dark:text-mint' : 'border-gray-300 dark:border-gray-700 text-slate-500 dark:text-slate-400 hover:bg-gray-50 dark:hover:bg-gray-800'
+                            }`}
+                          >
+                            {m} months
+                          </button>
+                        ))}
+                      </div>
+
+                      <ResponsiveContainer width="100%" height={260}>
+                        <LineChart data={predictChartData}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-gray-200 dark:text-gray-800" />
+                          <XAxis dataKey="month" fontSize={12} stroke="currentColor" className="text-slate-500 dark:text-slate-400" />
+                          <YAxis fontSize={12} stroke="currentColor" className="text-slate-500 dark:text-slate-400" tickFormatter={v => `$${(v / 1000).toFixed(1)}k`} />
+                          <Tooltip formatter={(value) => `$${Number(value).toFixed(2)}`} />
+                          <Legend />
+                          <Line type="monotone" dataKey="baseline" name="Baseline" stroke="#8892b0" strokeWidth={2} dot={false} />
+                          <Line type="monotone" dataKey="scenario" name="Your scenario" stroke="#64ffda" strokeWidth={2} dot={false} />
+                        </LineChart>
+                      </ResponsiveContainer>
+
+                      <div className="grid grid-cols-2 gap-4 mt-4 mb-6">
+                        <div className="bg-gray-50 dark:bg-gray-800/60 rounded-lg p-3">
+                          <p className="text-xs text-slate-500 dark:text-slate-400">Baseline in {predictMonths} months</p>
+                          <p className="text-lg font-mono font-semibold text-navy dark:text-gray-100">${projection.baselineFinal.toFixed(2)}</p>
+                        </div>
+                        <div className="bg-mint/10 rounded-lg p-3">
+                          <p className="text-xs text-slate-500 dark:text-slate-400">Your scenario in {predictMonths} months</p>
+                          <p className={`text-lg font-mono font-semibold ${projection.scenarioFinal >= projection.baselineFinal ? 'text-emerald-600 dark:text-mint' : 'text-red-500'}`}>
+                            ${projection.scenarioFinal.toFixed(2)}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-col gap-4">
+                        <div>
+                          <label className="flex justify-between text-xs font-medium text-slate-500 dark:text-slate-400 mb-1">
+                            <span>Income change</span>
+                            <span className="font-mono text-navy dark:text-gray-200">{predictIncomeDelta > 0 ? '+' : ''}{predictIncomeDelta}%</span>
+                          </label>
+                          <input
+                            type="range"
+                            min="-20"
+                            max="50"
+                            value={predictIncomeDelta}
+                            onChange={e => setPredictIncomeDelta(Number(e.target.value))}
+                            className="w-full accent-mint"
+                          />
+                        </div>
+
+                        {topPredictCategories.map(([category, avg]) => {
+                          const delta = predictAdjustments[category] || 0
+                          return (
+                            <div key={category}>
+                              <label className="flex justify-between text-xs font-medium text-slate-500 dark:text-slate-400 mb-1">
+                                <span className="flex items-center gap-1.5">
+                                  <CategoryIcon category={category} /> {category}
+                                  <span className="text-slate-400 dark:text-slate-500">(avg ${avg.toFixed(0)}/mo)</span>
+                                </span>
+                                <span className={`font-mono ${delta < 0 ? 'text-emerald-600 dark:text-mint' : delta > 0 ? 'text-red-500' : 'text-navy dark:text-gray-200'}`}>
+                                  {delta > 0 ? '+' : ''}{delta ? `$${delta}` : '$0'}/mo
+                                </span>
+                              </label>
+                              <input
+                                type="range"
+                                min={-Math.round(avg)}
+                                max={Math.round(avg)}
+                                value={delta}
+                                onChange={e => setPredictAdjustments(a => ({ ...a, [category]: Number(e.target.value) }))}
+                                className="w-full accent-mint"
+                              />
+                            </div>
+                          )
+                        })}
+                      </div>
+
+                      <div className="flex items-center gap-3 mt-6">
+                        <button onClick={getNarrative} disabled={narrating} className="btn-primary">
+                          {narrating ? 'Thinking…' : 'Get AI insight'}
+                        </button>
+                        <button
+                          onClick={() => { setPredictAdjustments({}); setPredictIncomeDelta(0); setPredictNarrative(null) }}
+                          className="px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-700 text-sm text-navy dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-800 transition"
+                        >
+                          Reset
+                        </button>
+                      </div>
+
+                      {predictNarrative && (
+                        <div className="mt-4 bg-gray-50 dark:bg-gray-800/60 border border-gray-200 dark:border-gray-700 rounded-lg px-4 py-3 text-sm text-navy dark:text-gray-200">
+                          💡 {predictNarrative}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </Card>
+              </div>
+            )}
+
+            {/* Household tab */}
+            {activeTab === 'household' && (
+              <div className="flex flex-col gap-6">
+                {!household ? (
+                  <Card title="Household" description="Share a read-only spending view with one other person — budgets, income, and everything else stay private to each of you.">
+                    <form onSubmit={sendHouseholdInvite} className="flex gap-2 max-w-md mb-6">
+                      <input
+                        type="email"
+                        value={inviteEmail}
+                        onChange={e => setInviteEmail(e.target.value)}
+                        placeholder="Their account email"
+                        className="flex-1 rounded-lg border border-gray-300 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-mint focus:border-mint"
+                      />
+                      <button type="submit" disabled={sendingInvite} className="btn-primary">
+                        {sendingInvite ? 'Sending…' : 'Send invite'}
+                      </button>
+                    </form>
+
+                    {householdInvites.length > 0 && (
+                      <div>
+                        <p className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-2">Pending invites for you</p>
+                        <div className="flex flex-col gap-2">
+                          {householdInvites.map(inv => (
+                            <div key={inv.id} className="flex items-center justify-between bg-gray-50 dark:bg-gray-800/60 border border-gray-200 dark:border-gray-700 rounded-lg px-4 py-2.5">
+                              <span className="text-sm text-navy dark:text-gray-200">
+                                {inv.fromName || inv.fromEmail} wants to share a household with you
+                              </span>
+                              <span className="flex gap-2 shrink-0 ml-3">
+                                <button onClick={() => acceptHouseholdInvite(inv.id)} className="text-xs px-3 py-1 rounded-md bg-mint text-navy font-medium hover:brightness-95 transition">
+                                  Accept
+                                </button>
+                                <button onClick={() => declineHouseholdInvite(inv.id)} className="text-xs px-3 py-1 rounded-md border border-gray-300 dark:border-gray-700 text-slate-500 dark:text-slate-400 hover:bg-gray-100 dark:hover:bg-gray-800 transition">
+                                  Decline
+                                </button>
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </Card>
+                ) : (
+                  <>
+                    <Card
+                      title="Household"
+                      headerRight={
+                        <button onClick={leaveHousehold} className="text-xs px-2.5 py-1 rounded-md border border-gray-300 dark:border-gray-700 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition">
+                          Leave household
+                        </button>
+                      }
+                    >
+                      <div className="flex gap-2 flex-wrap">
+                        {household.members.map(m => (
+                          <span key={m.uid} className="text-sm bg-gray-100 dark:bg-gray-800 text-navy dark:text-gray-200 px-3 py-1.5 rounded-full">
+                            {m.displayName}
+                          </span>
+                        ))}
+                      </div>
+                    </Card>
+
+                    {householdSpending && (
+                      <Card title="This month — combined spending" description="Read-only view of each member's current-month spending, sourced live from their own account.">
+                        <ResponsiveContainer width="100%" height={220}>
+                          <BarChart data={householdSpending.memberSpending.map(m => ({ name: m.displayName, spent: m.total }))}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-gray-200 dark:text-gray-800" />
+                            <XAxis dataKey="name" fontSize={12} stroke="currentColor" className="text-slate-500 dark:text-slate-400" />
+                            <YAxis fontSize={12} stroke="currentColor" className="text-slate-500 dark:text-slate-400" />
+                            <Tooltip formatter={(value) => `$${Number(value).toFixed(2)}`} />
+                            <Bar dataKey="spent" name="Spent" radius={[4, 4, 0, 0]}>
+                              {householdSpending.memberSpending.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+                            </Bar>
+                          </BarChart>
+                        </ResponsiveContainer>
+
+                        <div className="mt-4 pt-4 border-t border-gray-100 dark:border-gray-800">
+                          <p className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-2">Settle up (50/50 split)</p>
+                          <div className="flex flex-col gap-2">
+                            {householdSpending.settleUp.map(m => (
+                              <div key={m.uid} className="flex justify-between text-sm">
+                                <span className="text-navy dark:text-gray-200">{m.displayName}</span>
+                                <span className={`font-mono ${m.balance > 0.5 ? 'text-emerald-600 dark:text-mint' : m.balance < -0.5 ? 'text-red-500' : 'text-slate-400'}`}>
+                                  {m.balance > 0.5
+                                    ? `is owed $${m.balance.toFixed(2)}`
+                                    : m.balance < -0.5
+                                      ? `owes $${Math.abs(m.balance).toFixed(2)}`
+                                      : 'settled up'}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </Card>
+                    )}
+                  </>
+                )}
+              </div>
             )}
 
             {/* Chat tab */}
@@ -1097,7 +1536,7 @@ export default function Dashboard({ user, profile }) {
                   />
                   <button
                     type="button"
-                    onClick={startListening}
+                    onClick={() => startVoiceInput(setQuestion, setListening)}
                     title="Speak your question"
                     className={`px-3 py-2 rounded-lg text-sm transition flex items-center ${
                       listening ? 'bg-red-500 text-white' : 'bg-gray-100 dark:bg-gray-800 text-navy dark:text-gray-200 hover:bg-gray-200 dark:hover:bg-gray-700'
@@ -1110,6 +1549,20 @@ export default function Dashboard({ user, profile }) {
                   </button>
                 </form>
               </Card>
+            )}
+
+            {/* Settings tab */}
+            {activeTab === 'settings' && (
+              <Settings
+                user={user}
+                profile={profile}
+                setProfile={setProfile}
+                showToast={showToast}
+                categories={categories}
+                onCategoriesChanged={loadData}
+                baseTabs={BASE_TABS}
+                onTabsChanged={() => setTabs(loadTabs())}
+              />
             )}
               </motion.div>
             </AnimatePresence>
@@ -1134,6 +1587,17 @@ export default function Dashboard({ user, profile }) {
           }}
         />
       )}
+      {showReceiptWizard && (
+        <ReceiptWizard
+          categories={categories}
+          onClose={() => setShowReceiptWizard(false)}
+          onImported={async (count) => {
+            setShowReceiptWizard(false)
+            await loadData()
+            showToast(`Imported ${count} item${count === 1 ? '' : 's'} from receipt`)
+          }}
+        />
+      )}
       <ToastContainer toasts={toasts} />
     </div>
   )
@@ -1148,12 +1612,15 @@ function Stat({ label, value, accent = 'text-white' }) {
   )
 }
 
-function Card({ title, headerRight, children, className = '', bodyClassName = 'p-5' }) {
+function Card({ title, description, headerRight, children, className = '', bodyClassName = 'p-5' }) {
   return (
     <div className={`bg-white/85 dark:bg-gray-900/80 backdrop-blur-md rounded-2xl border border-gray-200 dark:border-gray-800 shadow-sm ${bodyClassName} ${className}`}>
       {title && (
-        <div className="flex justify-between items-center mb-3">
-          <h3 className="font-semibold text-navy dark:text-gray-100">{title}</h3>
+        <div className="flex justify-between items-start mb-3">
+          <div>
+            <h3 className="font-semibold text-navy dark:text-gray-100">{title}</h3>
+            {description && <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">{description}</p>}
+          </div>
           {headerRight}
         </div>
       )}

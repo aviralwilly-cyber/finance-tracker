@@ -1,10 +1,8 @@
 import { initializeApp } from 'firebase/app'
 import { getAuth } from 'firebase/auth'
+// import { getStorage } from 'firebase/storage'
 
-// Fill these in from: Firebase Console → Project settings → General →
-// "Your apps" → Web app (</> icon) → register an app if you haven't yet.
-// This config is safe to keep in frontend code — it identifies your project,
-// it doesn't grant access on its own (Firestore security rules do that).
+
 const firebaseConfig = {
   apiKey: "AIzaSyCg-ijkzPIuoMUpxpvYqoPjcEatFumTVTE",
   authDomain: "finance-tracker-45e42.firebaseapp.com",
@@ -16,3 +14,6 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig)
 export const auth = getAuth(app)
+// export const storage = getStorage(app)
+
+
