@@ -82,6 +82,17 @@ function ComponentBar({ label, score, max, hint }) {
 
 export default function HealthScore({ data }) {
   if (!data) return null
+
+  // The backend refuses to score an account with no transactions or income,
+  // rather than returning a flattering number built from nothing.
+  if (data.insufficientData) {
+    return (
+      <p className="text-sm text-slate-500 dark:text-slate-400">
+        {data.message}
+      </p>
+    )
+  }
+
   const { score, grade, components, tip } = data
 
   return (

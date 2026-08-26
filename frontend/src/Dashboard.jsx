@@ -2,9 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend, BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid } from 'recharts'
 import { signOut } from 'firebase/auth'
-import { Mic, Upload, Camera, TrendingUp, Users, ChevronLeft, ChevronRight, LayoutDashboard, Receipt, PiggyBank, Wallet, MessageCircle, Settings as SettingsIcon } from 'lucide-react'
+import { Mic, Upload, Camera, TrendingUp, Users, Shield, Megaphone, Sparkles, ChevronLeft, ChevronRight, LayoutDashboard, Receipt, PiggyBank, Wallet, MessageCircle, Settings as SettingsIcon } from 'lucide-react'
 import { auth } from './firebase'
-import { authedFetch } from './api'
+import { authedFetch, API } from './api'
 import ConfirmDialog from './ConfirmDialog'
 import { useToasts, ToastContainer } from './Toast'
 import CategoryIcon from './CategoryIcon'
@@ -15,12 +15,20 @@ import Sidebar from './Sidebar'
 import Lightfall from './Lightfall'
 import Settings from './Settings'
 import HealthScore from './HealthScore'
+import Admin from './Admin'
+import DeepAnalysis from './DeepAnalysis'
 
 const COLORS = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#06b6d4', '#a855f7', '#ec4899', '#84cc16', '#f97316', '#14b8a6', '#64748b']
 const SAVINGS_COLORS = ['#4ade80', '#60a5fa', '#facc15', '#a78bfa']
 
 // Fixed identity (id + icon) for every tab — only order and display label
 // are customizable, via Settings → Navigation.
+// Tabs where the income/spending numbers are actually relevant to what
+// you're doing — you want "remaining this month" visible while logging a
+// transaction or setting a budget. On Chat, Analyze, Settings, Predict and
+// Admin it's ~200px of stats you aren't thinking about, so it's hidden.
+const SHOW_INCOME_ON = ['overview', 'transactions', 'savings', 'budgets', 'household']
+
 const BASE_TABS = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
   { id: 'transactions', label: 'Transactions', icon: Receipt },
@@ -29,16 +37,23 @@ const BASE_TABS = [
   { id: 'predict', label: 'Predict', icon: TrendingUp },
   { id: 'household', label: 'Household', icon: Users },
   { id: 'chat', label: 'Chat', icon: MessageCircle },
-  { id: 'settings', label: 'Settings', icon: SettingsIcon }
+  { id: 'analyze', label: 'Analyze', icon: Sparkles },
+  { id: 'settings', label: 'Settings', icon: SettingsIcon },
+  // Only rendered for users whose server-side profile role is 'admin'.
+  // Hiding the tab is cosmetic — the actual protection is requireAdmin on
+  // every /api/admin/* route, so a non-admin who forced this tab open
+  // would just get 404s.
+  { id: 'admin', label: 'Admin', icon: Shield, adminOnly: true }
 ]
 
 // Reads any saved custom order/labels from localStorage and applies them on
 // top of BASE_TABS. Falls back gracefully to defaults if nothing's saved,
 // and stays forward-compatible if a future BASE_TABS entry isn't in an
 // older saved order yet (it just gets appended at the end).
-function loadTabs() {
-  const byId = Object.fromEntries(BASE_TABS.map(t => [t.id, t]))
-  let order = BASE_TABS.map(t => t.id)
+function loadTabs(isAdmin = false) {
+  const available = BASE_TABS.filter(t => !t.adminOnly || isAdmin)
+  const byId = Object.fromEntries(available.map(t => [t.id, t]))
+  let order = available.map(t => t.id)
   let labels = {}
   try {
     const savedOrder = JSON.parse(localStorage.getItem('tabOrder') || 'null')
@@ -48,7 +63,7 @@ function loadTabs() {
   } catch {
     // malformed localStorage — just use defaults
   }
-  const missing = BASE_TABS.map(t => t.id).filter(id => !order.includes(id))
+  const missing = available.map(t => t.id).filter(id => !order.includes(id))
   return [...order, ...missing].map(id => ({
     id,
     label: labels[id] || byId[id].label,
@@ -58,7 +73,24 @@ function loadTabs() {
 
 export default function Dashboard({ user, profile, setProfile }) {
   const { toasts, showToast } = useToasts()
-  const [tabs, setTabs] = useState(loadTabs)
+  const isAdmin = profile?.role === 'admin'
+
+  // Admin-set banner, if any. Public endpoint (no auth) so it can also be
+  // read before login if ever needed.
+  const [broadcast, setBroadcast] = useState('')
+  useEffect(() => {
+    fetch(`${API}/public-settings`)
+      .then(r => r.json())
+      .then(d => setBroadcast(d.broadcastMessage || ''))
+      .catch(() => {}) // a missing banner should never break the dashboard
+  }, [])
+  const [tabs, setTabs] = useState(() => loadTabs(isAdmin))
+
+  // The profile (and therefore role) arrives asynchronously, so rebuild the
+  // tab list once it's known.
+  useEffect(() => {
+    setTabs(loadTabs(isAdmin))
+  }, [isAdmin])
   const [categories, setCategories] = useState([])
   const [confirmState, setConfirmState] = useState(null) // { message, onConfirm } | null
   const [activeTab, setActiveTab] = useState(() => localStorage.getItem('defaultTab') || 'overview')
@@ -160,6 +192,7 @@ export default function Dashboard({ user, profile, setProfile }) {
   // --- Household mode ---
   const [household, setHousehold] = useState(null) // { id, members: [{uid, displayName, email}] } | null
   const [householdInvites, setHouseholdInvites] = useState([]) // pending invites addressed to me
+  const [sentInvites, setSentInvites] = useState([]) // pending invites I've sent
   const [householdSpending, setHouseholdSpending] = useState(null)
 
   const loadHousehold = async () => {
@@ -169,7 +202,9 @@ export default function Dashboard({ user, profile, setProfile }) {
     ])
     const houseData = await houseRes.json()
     setHousehold(houseData.household)
-    setHouseholdInvites(await invitesRes.json())
+    const invites = await invitesRes.json()
+    setHouseholdInvites(invites.received || [])
+    setSentInvites(invites.sent || [])
 
     if (houseData.household) {
       const spendRes = await authedFetch('/household/spending')
@@ -198,7 +233,19 @@ export default function Dashboard({ user, profile, setProfile }) {
       return
     }
     setInviteEmail('')
-    showToast('Invite sent')
+    const data = await res.json().catch(() => ({}))
+    showToast(
+      data.alreadyPending
+        ? 'They already have a pending invite from you'
+        : "Invite sent — they'll see it in their Household tab"
+    )
+    loadHousehold()
+  }
+
+  const cancelSentInvite = async (id) => {
+    await authedFetch(`/household/invites/${id}`, { method: 'DELETE' })
+    await loadHousehold()
+    showToast('Invite cancelled')
   }
 
   const acceptHouseholdInvite = async (id) => {
@@ -215,6 +262,7 @@ export default function Dashboard({ user, profile, setProfile }) {
   const leaveHousehold = () => {
     setConfirmState({
       message: "Leave this household? You'll stop seeing each other's shared spending view.",
+      confirmLabel: 'Leave household',
       onConfirm: async () => {
         await authedFetch('/household/leave', { method: 'DELETE' })
         setConfirmState(null)
@@ -299,29 +347,69 @@ export default function Dashboard({ user, profile, setProfile }) {
     loadData().finally(() => setInitialLoading(false))
   }, [])
 
+  // --- Optimistic updates ---
+  //
+  // Every mutation used to await the server AND a full 13-endpoint refetch
+  // before the UI moved at all, which made even deleting one row feel slow.
+  //
+  // Deletes are fully optimistic: we know exactly what disappears, so the
+  // row goes immediately and we roll back if the request fails.
+  //
+  // Adds can't be — the server assigns the id and the AI assigns the
+  // category, so the real row isn't knowable client-side. Instead they
+  // splice the server's response straight into state rather than refetching
+  // everything, which is still far faster than the old path.
+  //
+  // Derived figures (overview, budgets, health score, trend) genuinely do
+  // need recomputing server-side, so those refresh in the background
+  // WITHOUT blocking the interaction that triggered them.
+
+  const refreshDerived = () => {
+    // Fire-and-forget: updates totals/charts after the fact. Deliberately
+    // not awaited, so the UI never waits on it.
+    loadData().catch(err => console.error('Background refresh failed:', err))
+  }
+
   const addTransaction = async (e) => {
     e.preventDefault()
     if (!form.description || !form.amount || !form.date) return
     setLoading(true)
-    await authedFetch('/transactions', {
+    const res = await authedFetch('/transactions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(form)
     })
-    setForm({ description: '', amount: '', date: '' })
-    await loadData()
     setLoading(false)
+
+    if (!res.ok) {
+      showToast("Couldn't add that transaction", 'error')
+      return
+    }
+
+    const created = await res.json()
+    // Splice the real row in immediately, keeping the list date-sorted.
+    setTransactions(prev => [created, ...prev].sort((a, b) => (a.date < b.date ? 1 : -1)))
+    setForm({ description: '', amount: '', date: '' })
     showToast('Transaction added')
+    refreshDerived()
   }
 
   const deleteTransaction = (id, description) => {
     setConfirmState({
       message: `Delete "${description}"? This can't be undone.`,
       onConfirm: async () => {
-        await authedFetch(`/transactions/${id}`, { method: 'DELETE' })
         setConfirmState(null)
-        await loadData()
+        const previous = transactions
+        setTransactions(prev => prev.filter(t => t.id !== id)) // gone instantly
         showToast('Transaction deleted')
+
+        const res = await authedFetch(`/transactions/${id}`, { method: 'DELETE' })
+        if (!res.ok) {
+          setTransactions(previous) // roll back — the row never actually went away
+          showToast("Couldn't delete that — put it back", 'error')
+          return
+        }
+        refreshDerived()
       }
     })
   }
@@ -343,34 +431,51 @@ export default function Dashboard({ user, profile, setProfile }) {
     }
     const transaction = await res.json()
     setQuickAddText('')
-    await loadData()
+    setTransactions(prev => [transaction, ...prev].sort((a, b) => (a.date < b.date ? 1 : -1)))
     showToast(`Added "${transaction.description}" — $${transaction.amount.toFixed(2)}`)
+    refreshDerived()
   }
 
   const addRecurring = async (e) => {
     e.preventDefault()
     if (!recurringForm.description || !recurringForm.amount || !recurringForm.startDate) return
     setSavingRecurring(true)
-    await authedFetch('/recurring', {
+    const res = await authedFetch('/recurring', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(recurringForm)
     })
+    setSavingRecurring(false)
+
+    if (!res.ok) {
+      showToast("Couldn't set up that recurring transaction", 'error')
+      return
+    }
+
+    const created = await res.json()
+    setRecurring(prev => [...prev, created].sort((a, b) => (a.nextDueDate > b.nextDueDate ? 1 : -1)))
     setRecurringForm(f => ({ ...f, description: '', amount: '', startDate: '' }))
     setShowRecurringForm(false)
-    await loadData()
-    setSavingRecurring(false)
     showToast('Recurring transaction set up')
+    refreshDerived()
   }
 
   const deleteRecurring = (id, description) => {
     setConfirmState({
       message: `Stop the recurring "${description}" transaction? Past transactions it already created won't be removed.`,
+      confirmLabel: 'Stop recurring',
       onConfirm: async () => {
-        await authedFetch(`/recurring/${id}`, { method: 'DELETE' })
         setConfirmState(null)
-        await loadData()
+        const previous = recurring
+        setRecurring(prev => prev.filter(r => r.id !== id))
         showToast('Recurring transaction removed')
+
+        const res = await authedFetch(`/recurring/${id}`, { method: 'DELETE' })
+        if (!res.ok) {
+          setRecurring(previous)
+          showToast("Couldn't remove that — put it back", 'error')
+          return
+        }
       }
     })
   }
@@ -414,10 +519,18 @@ export default function Dashboard({ user, profile, setProfile }) {
     setConfirmState({
       message: `Delete the income entry effective from ${effectiveDate}? This can't be undone.`,
       onConfirm: async () => {
-        await authedFetch(`/income/${id}`, { method: 'DELETE' })
         setConfirmState(null)
-        await loadData()
+        const previous = incomeHistory
+        setIncomeHistory(prev => prev.filter(e => e.id !== id))
         showToast('Income entry deleted')
+
+        const res = await authedFetch(`/income/${id}`, { method: 'DELETE' })
+        if (!res.ok) {
+          setIncomeHistory(previous)
+          showToast("Couldn't delete that — put it back", 'error')
+          return
+        }
+        refreshDerived()
       }
     })
   }
@@ -426,25 +539,41 @@ export default function Dashboard({ user, profile, setProfile }) {
     e.preventDefault()
     if (!savingsForm.amount || !savingsForm.date) return
     setSavingSavings(true)
-    await authedFetch('/savings', {
+    const res = await authedFetch('/savings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(savingsForm)
     })
-    setSavingsForm({ type: 'Savings', description: '', amount: '', date: '' })
-    await loadData()
     setSavingSavings(false)
+
+    if (!res.ok) {
+      showToast("Couldn't add that savings entry", 'error')
+      return
+    }
+
+    const created = await res.json()
+    setSavings(prev => [created, ...prev].sort((a, b) => (a.date < b.date ? 1 : -1)))
+    setSavingsForm({ type: 'Savings', description: '', amount: '', date: '' })
     showToast('Savings entry added')
+    refreshDerived()
   }
 
   const deleteSavings = (id, type) => {
     setConfirmState({
       message: `Delete this ${type} entry? This can't be undone.`,
       onConfirm: async () => {
-        await authedFetch(`/savings/${id}`, { method: 'DELETE' })
         setConfirmState(null)
-        await loadData()
+        const previous = savings
+        setSavings(prev => prev.filter(s => s.id !== id))
         showToast('Savings entry deleted')
+
+        const res = await authedFetch(`/savings/${id}`, { method: 'DELETE' })
+        if (!res.ok) {
+          setSavings(previous)
+          showToast("Couldn't delete that — put it back", 'error')
+          return
+        }
+        refreshDerived()
       }
     })
   }
@@ -453,12 +582,22 @@ export default function Dashboard({ user, profile, setProfile }) {
     e.preventDefault()
     if (!budgetForm.limit) return
     setSavingBudget(true)
-    await authedFetch('/budgets', {
+    const res = await authedFetch('/budgets', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(budgetForm)
     })
+
+    if (!res.ok) {
+      setSavingBudget(false)
+      showToast("Couldn't save that budget", 'error')
+      return
+    }
+
     setBudgetForm(f => ({ ...f, limit: '' }))
+    // Budget progress (percent spent, colour, AI nudge) is computed
+    // server-side against this month's transactions, so unlike a plain list
+    // insert there's nothing meaningful to splice in optimistically here.
     await loadData()
     setSavingBudget(false)
     showToast('Budget saved')
@@ -467,11 +606,20 @@ export default function Dashboard({ user, profile, setProfile }) {
   const deleteBudget = (category) => {
     setConfirmState({
       message: `Remove the ${category} budget?`,
+      confirmLabel: 'Remove budget',
       onConfirm: async () => {
-        await authedFetch(`/budgets/${category}`, { method: 'DELETE' })
         setConfirmState(null)
-        await loadData()
+        const previous = budgetProgress
+        setBudgetProgress(prev => prev.filter(b => b.category !== category))
         showToast('Budget removed')
+
+        const res = await authedFetch(`/budgets/${category}`, { method: 'DELETE' })
+        if (!res.ok) {
+          setBudgetProgress(previous)
+          showToast("Couldn't remove that — put it back", 'error')
+          return
+        }
+        refreshDerived()
       }
     })
   }
@@ -644,10 +792,10 @@ export default function Dashboard({ user, profile, setProfile }) {
         onLogout={() => signOut(auth)}
       />
 
-      <div className="flex-1 min-w-0 relative z-10">
+      <div className="flex-1 min-w-0 relative z-10 pt-14 md:pt-0">
         {/* Sticky page header + overview — hides on scroll down, reappears on scroll up */}
         <motion.div
-          className="sticky top-0 z-20 bg-gray-50/80 dark:bg-gray-950/80 backdrop-blur-md border-b border-gray-200 dark:border-gray-800"
+          className="sticky top-14 md:top-0 z-20 bg-gray-50/80 dark:bg-gray-950/80 backdrop-blur-md border-b border-gray-200 dark:border-gray-800"
           animate={{
             y: headerHidden ? '-100%' : '0%',
             opacity: headerHidden ? 0 : 1
@@ -655,12 +803,18 @@ export default function Dashboard({ user, profile, setProfile }) {
           style={{ pointerEvents: headerHidden ? 'none' : 'auto' }}
           transition={{ duration: 0.2, ease: 'easeInOut' }}
         >
-          <div className="max-w-4xl mx-auto px-6 pt-6 pb-4">
+          <div className="max-w-4xl mx-auto px-4 sm:px-6 pt-6 pb-4">
+            {broadcast && (
+              <div className="flex items-start gap-2 bg-sky-50 dark:bg-sky-900/30 border border-sky-300 dark:border-sky-800 rounded-lg px-4 py-2.5 text-sm mb-4 text-sky-900 dark:text-sky-100">
+                <Megaphone className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>{broadcast}</span>
+              </div>
+            )}
             <p className="text-slate-500 dark:text-slate-400 text-sm mb-4">
               {profile?.displayName ? `Welcome back, ${profile.displayName}.` : 'Add a transaction and AI will categorize it automatically.'}
             </p>
 
-            {!initialLoading && (
+            {!initialLoading && SHOW_INCOME_ON.includes(activeTab) && (
               <>
                 {/* Overview card */}
                 <div className="bg-navy/95 dark:bg-gray-900/90 backdrop-blur-md dark:border dark:border-gray-800 text-white rounded-2xl shadow-lg p-5">
@@ -756,26 +910,28 @@ export default function Dashboard({ user, profile, setProfile }) {
                       {trend.length > 0 && (
                         <div className="mt-4 pt-4 border-t border-white/10 max-h-56 overflow-y-auto">
                           <p className="text-xs text-slate-400 mb-2">Monthly summary</p>
-                          <table className="w-full text-xs">
-                            <thead>
-                              <tr className="text-left text-slate-400 border-b border-white/10">
-                                <th className="pb-1.5 font-medium">Month</th>
-                                <th className="pb-1.5 font-medium">Income</th>
-                                <th className="pb-1.5 font-medium">Spent</th>
-                                <th className="pb-1.5 font-medium">Saved</th>
-                              </tr>
-                            </thead>
-                            <tbody className="font-mono">
-                              {[...trend].reverse().map(m => (
-                                <tr key={m.month} className="border-b border-white/5 hover:bg-white/5 transition-colors">
-                                  <td className="py-1.5 font-sans text-slate-300">{m.month}</td>
-                                  <td className="py-1.5 text-sky-400">${m.income.toFixed(2)}</td>
-                                  <td className="py-1.5 text-red-400">${m.spent.toFixed(2)}</td>
-                                  <td className="py-1.5 text-mint">${m.saved.toFixed(2)}</td>
+                          <div className="overflow-x-auto -mx-1 px-1">
+                            <table className="w-full text-xs">
+                              <thead>
+                                <tr className="text-left text-slate-400 border-b border-white/10">
+                                  <th className="pb-1.5 font-medium">Month</th>
+                                  <th className="pb-1.5 font-medium">Income</th>
+                                  <th className="pb-1.5 font-medium">Spent</th>
+                                  <th className="pb-1.5 font-medium">Saved</th>
                                 </tr>
-                              ))}
-                            </tbody>
-                          </table>
+                              </thead>
+                              <tbody className="font-mono">
+                                {[...trend].reverse().map(m => (
+                                  <tr key={m.month} className="border-b border-white/5 hover:bg-white/5 transition-colors">
+                                    <td className="py-1.5 font-sans text-slate-300">{m.month}</td>
+                                    <td className="py-1.5 text-sky-400">${m.income.toFixed(2)}</td>
+                                    <td className="py-1.5 text-red-400">${m.spent.toFixed(2)}</td>
+                                    <td className="py-1.5 text-mint">${m.saved.toFixed(2)}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
                         </div>
                       )}
                     </motion.div>
@@ -787,7 +943,7 @@ export default function Dashboard({ user, profile, setProfile }) {
           </div>
         </motion.div>
 
-        <div className="max-w-4xl mx-auto px-6 py-6">
+        <div className="max-w-4xl mx-auto px-4 sm:px-6 py-6">
           {initialLoading ? (
             <div className="flex flex-col gap-6">
               <SkeletonCard lines={4} />
@@ -833,41 +989,43 @@ export default function Dashboard({ user, profile, setProfile }) {
                     <summary className="cursor-pointer text-xs text-slate-500 dark:text-slate-400 hover:text-navy dark:hover:text-mint transition select-none">
                       Full income history ({incomeHistory.length})
                     </summary>
-                    <table className="w-full mt-2 text-xs border-collapse">
-                      <thead>
-                        <tr className="text-left border-b border-gray-200 dark:border-gray-700 text-slate-500 dark:text-slate-400">
-                          <th className="pb-1.5 font-medium">Effective from</th>
-                          <th className="pb-1.5 font-medium">Amount</th>
-                          <th className="pb-1.5 font-medium">Frequency</th>
-                          <th className="pb-1.5 font-medium">Monthly equivalent</th>
-                          <th className="pb-1.5 font-medium"></th>
-                        </tr>
-                      </thead>
-                      <tbody className="font-mono">
-                        {incomeHistory.map(entry => (
-                          <tr key={entry.id} className="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/40 transition-colors">
-                            <td className="py-1.5 font-sans">{entry.effectiveDate}</td>
-                            <td className="py-1.5">${Number(entry.amount).toFixed(2)}</td>
-                            <td className="py-1.5 capitalize font-sans">{entry.frequency}</td>
-                            <td className="py-1.5">${(entry.frequency === 'biweekly' ? entry.amount * (26 / 12) : entry.amount).toFixed(2)}</td>
-                            <td className="py-1.5 font-sans text-right">
-                              <button
-                                onClick={() => { setActiveTab('overview'); startEditIncome(entry) }}
-                                className="text-slate-400 hover:text-navy dark:hover:text-mint transition mr-2"
-                              >
-                                Edit
-                              </button>
-                              <button
-                                onClick={() => deleteIncome(entry.id, entry.effectiveDate)}
-                                className="text-red-500 hover:text-red-700 transition"
-                              >
-                                ✕
-                              </button>
-                            </td>
+                    <div className="overflow-x-auto -mx-1 px-1">
+                      <table className="w-full mt-2 text-xs border-collapse">
+                        <thead>
+                          <tr className="text-left border-b border-gray-200 dark:border-gray-700 text-slate-500 dark:text-slate-400">
+                            <th className="pb-1.5 font-medium">Effective from</th>
+                            <th className="pb-1.5 font-medium">Amount</th>
+                            <th className="pb-1.5 font-medium">Frequency</th>
+                            <th className="pb-1.5 font-medium">Monthly equivalent</th>
+                            <th className="pb-1.5 font-medium"></th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                        </thead>
+                        <tbody className="font-mono">
+                          {incomeHistory.map(entry => (
+                            <tr key={entry.id} className="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/40 transition-colors">
+                              <td className="py-1.5 font-sans">{entry.effectiveDate}</td>
+                              <td className="py-1.5">${Number(entry.amount).toFixed(2)}</td>
+                              <td className="py-1.5 capitalize font-sans">{entry.frequency}</td>
+                              <td className="py-1.5">${(entry.frequency === 'biweekly' ? entry.amount * (26 / 12) : entry.amount).toFixed(2)}</td>
+                              <td className="py-1.5 font-sans text-right">
+                                <button
+                                  onClick={() => { setActiveTab('overview'); startEditIncome(entry) }}
+                                  className="text-slate-400 hover:text-navy dark:hover:text-mint transition mr-2"
+                                >
+                                  Edit
+                                </button>
+                                <button
+                                  onClick={() => deleteIncome(entry.id, entry.effectiveDate)}
+                                  className="text-red-500 hover:text-red-700 transition"
+                                >
+                                  ✕
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
                   </details>
                 )}
               </Card>
@@ -968,42 +1126,44 @@ export default function Dashboard({ user, profile, setProfile }) {
                         </select>
                       </div>
                     </div>
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="text-left border-y border-gray-200 dark:border-gray-700 text-slate-500 dark:text-slate-400 text-xs">
-                          <th className="px-5 py-2 font-medium">Date</th>
-                          <th className="px-2 py-2 font-medium">Description</th>
-                          <th className="px-2 py-2 font-medium">Category</th>
-                          <th className="px-2 py-2 font-medium">Amount</th>
-                          <th className="px-2 py-2"></th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {paginatedTransactions.map(t => (
-                          <tr key={t.id} className="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/60 transition">
-                            <td className="px-5 py-2 font-mono text-xs text-slate-500 dark:text-slate-400">{t.date}</td>
-                            <td className="px-2 py-2 dark:text-gray-200">{t.description}</td>
-                            <td className="px-2 py-2">
-                              <span className="inline-flex items-center gap-1.5 bg-gray-100 dark:bg-gray-700 text-navy dark:text-gray-200 text-xs px-2 py-0.5 rounded-full">
-                                <CategoryIcon category={t.category} />
-                                {t.category}
-                              </span>
-                            </td>
-                            <td className="px-2 py-2 font-mono dark:text-gray-200">${Number(t.amount).toFixed(2)}</td>
-                            <td className="px-2 py-2">
-                              <button onClick={() => deleteTransaction(t.id, t.description)} className="text-red-500 hover:text-red-700 transition">✕</button>
-                            </td>
+                    <div className="overflow-x-auto -mx-1 px-1">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="text-left border-y border-gray-200 dark:border-gray-700 text-slate-500 dark:text-slate-400 text-xs">
+                            <th className="px-5 py-2 font-medium">Date</th>
+                            <th className="px-2 py-2 font-medium">Description</th>
+                            <th className="px-2 py-2 font-medium">Category</th>
+                            <th className="px-2 py-2 font-medium">Amount</th>
+                            <th className="px-2 py-2"></th>
                           </tr>
-                        ))}
-                        {filteredTransactions.length === 0 && (
-                          <tr>
-                            <td colSpan={5} className="px-5 py-6 text-slate-400 dark:text-slate-500 text-sm">
-                              {transactions.length === 0 ? 'No transactions yet — add one above.' : 'No transactions match your filters.'}
-                            </td>
-                          </tr>
-                        )}
-                      </tbody>
-                    </table>
+                        </thead>
+                        <tbody>
+                          {paginatedTransactions.map(t => (
+                            <tr key={t.id} className="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/60 transition">
+                              <td className="px-5 py-2 font-mono text-xs text-slate-500 dark:text-slate-400">{t.date}</td>
+                              <td className="px-2 py-2 dark:text-gray-200">{t.description}</td>
+                              <td className="px-2 py-2">
+                                <span className="inline-flex items-center gap-1.5 bg-gray-100 dark:bg-gray-700 text-navy dark:text-gray-200 text-xs px-2 py-0.5 rounded-full">
+                                  <CategoryIcon category={t.category} />
+                                  {t.category}
+                                </span>
+                              </td>
+                              <td className="px-2 py-2 font-mono dark:text-gray-200">${Number(t.amount).toFixed(2)}</td>
+                              <td className="px-2 py-2">
+                                <button onClick={() => deleteTransaction(t.id, t.description)} className="text-red-500 hover:text-red-700 transition">✕</button>
+                              </td>
+                            </tr>
+                          ))}
+                          {filteredTransactions.length === 0 && (
+                            <tr>
+                              <td colSpan={5} className="px-5 py-6 text-slate-400 dark:text-slate-500 text-sm">
+                                {transactions.length === 0 ? 'No transactions yet — add one above.' : 'No transactions match your filters.'}
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
                     {filteredTransactions.length > TRANSACTIONS_PER_PAGE && (
                       <div className="flex justify-between items-center px-5 py-3 border-t border-gray-100 dark:border-gray-800 text-xs text-slate-500 dark:text-slate-400">
                         <span>
@@ -1104,37 +1264,39 @@ export default function Dashboard({ user, profile, setProfile }) {
                   {recurring.length === 0 ? (
                     <p className="text-slate-400 dark:text-slate-500 text-sm">No recurring transactions set up — good for rent, subscriptions, or anything you pay on a schedule.</p>
                   ) : (
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="text-left border-b border-gray-200 dark:border-gray-700 text-slate-500 dark:text-slate-400 text-xs">
-                          <th className="pb-2 font-medium">Description</th>
-                          <th className="pb-2 font-medium">Amount</th>
-                          <th className="pb-2 font-medium">Category</th>
-                          <th className="pb-2 font-medium">Frequency</th>
-                          <th className="pb-2 font-medium">Next due</th>
-                          <th className="pb-2"></th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {recurring.map(r => (
-                          <tr key={r.id} className="border-b border-gray-100 dark:border-gray-800">
-                            <td className="py-2 dark:text-gray-200">{r.description}</td>
-                            <td className="py-2 font-mono dark:text-gray-200">${Number(r.amount).toFixed(2)}</td>
-                            <td className="py-2">
-                              <span className="inline-flex items-center gap-1.5 bg-gray-100 dark:bg-gray-700 text-navy dark:text-gray-200 text-xs px-2 py-0.5 rounded-full">
-                                <CategoryIcon category={r.category} />
-                                {r.category}
-                              </span>
-                            </td>
-                            <td className="py-2 capitalize dark:text-gray-300">{r.frequency}</td>
-                            <td className="py-2 font-mono text-xs text-slate-500 dark:text-slate-400">{r.nextDueDate}</td>
-                            <td className="py-2">
-                              <button onClick={() => deleteRecurring(r.id, r.description)} className="text-red-500 hover:text-red-700 transition">✕</button>
-                            </td>
+                    <div className="overflow-x-auto -mx-1 px-1">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="text-left border-b border-gray-200 dark:border-gray-700 text-slate-500 dark:text-slate-400 text-xs">
+                            <th className="pb-2 font-medium">Description</th>
+                            <th className="pb-2 font-medium">Amount</th>
+                            <th className="pb-2 font-medium">Category</th>
+                            <th className="pb-2 font-medium">Frequency</th>
+                            <th className="pb-2 font-medium">Next due</th>
+                            <th className="pb-2"></th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                        </thead>
+                        <tbody>
+                          {recurring.map(r => (
+                            <tr key={r.id} className="border-b border-gray-100 dark:border-gray-800">
+                              <td className="py-2 dark:text-gray-200">{r.description}</td>
+                              <td className="py-2 font-mono dark:text-gray-200">${Number(r.amount).toFixed(2)}</td>
+                              <td className="py-2">
+                                <span className="inline-flex items-center gap-1.5 bg-gray-100 dark:bg-gray-700 text-navy dark:text-gray-200 text-xs px-2 py-0.5 rounded-full">
+                                  <CategoryIcon category={r.category} />
+                                  {r.category}
+                                </span>
+                              </td>
+                              <td className="py-2 capitalize dark:text-gray-300">{r.frequency}</td>
+                              <td className="py-2 font-mono text-xs text-slate-500 dark:text-slate-400">{r.nextDueDate}</td>
+                              <td className="py-2">
+                                <button onClick={() => deleteRecurring(r.id, r.description)} className="text-red-500 hover:text-red-700 transition">✕</button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
                   )}
                 </Card>
               </div>
@@ -1181,31 +1343,33 @@ export default function Dashboard({ user, profile, setProfile }) {
 
                 <div className="flex flex-wrap gap-8">
                   <div className="flex-1 min-w-[300px]">
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="text-left border-b border-gray-200 dark:border-gray-700 text-slate-500 dark:text-slate-400 text-xs">
-                          <th className="pb-2 font-medium">Date</th>
-                          <th className="pb-2 font-medium">Type</th>
-                          <th className="pb-2 font-medium">Description</th>
-                          <th className="pb-2 font-medium">Amount</th>
-                          <th className="pb-2"></th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {savings.map(s => (
-                          <tr key={s.id} className="border-b border-gray-100 dark:border-gray-800">
-                            <td className="py-2 font-mono text-xs text-slate-500 dark:text-slate-400">{s.date}</td>
-                            <td className="py-2"><span className="bg-emerald-50 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-400 text-xs px-2 py-0.5 rounded-full">{s.type}</span></td>
-                            <td className="py-2 dark:text-gray-200">{s.description || '—'}</td>
-                            <td className="py-2 font-mono dark:text-gray-200">${Number(s.amount).toFixed(2)}</td>
-                            <td className="py-2"><button onClick={() => deleteSavings(s.id, s.type)} className="text-red-500 hover:text-red-700 transition">✕</button></td>
+                    <div className="overflow-x-auto -mx-1 px-1">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="text-left border-b border-gray-200 dark:border-gray-700 text-slate-500 dark:text-slate-400 text-xs">
+                            <th className="pb-2 font-medium">Date</th>
+                            <th className="pb-2 font-medium">Type</th>
+                            <th className="pb-2 font-medium">Description</th>
+                            <th className="pb-2 font-medium">Amount</th>
+                            <th className="pb-2"></th>
                           </tr>
-                        ))}
-                        {savings.length === 0 && (
-                          <tr><td colSpan={5} className="py-6 text-slate-400 dark:text-slate-500 text-sm">No savings or investments logged yet — add one above.</td></tr>
-                        )}
-                      </tbody>
-                    </table>
+                        </thead>
+                        <tbody>
+                          {savings.map(s => (
+                            <tr key={s.id} className="border-b border-gray-100 dark:border-gray-800">
+                              <td className="py-2 font-mono text-xs text-slate-500 dark:text-slate-400">{s.date}</td>
+                              <td className="py-2"><span className="bg-emerald-50 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-400 text-xs px-2 py-0.5 rounded-full">{s.type}</span></td>
+                              <td className="py-2 dark:text-gray-200">{s.description || '—'}</td>
+                              <td className="py-2 font-mono dark:text-gray-200">${Number(s.amount).toFixed(2)}</td>
+                              <td className="py-2"><button onClick={() => deleteSavings(s.id, s.type)} className="text-red-500 hover:text-red-700 transition">✕</button></td>
+                            </tr>
+                          ))}
+                          {savings.length === 0 && (
+                            <tr><td colSpan={5} className="py-6 text-slate-400 dark:text-slate-500 text-sm">No savings or investments logged yet — add one above.</td></tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
 
                   <div className="flex-1 min-w-[300px]">
@@ -1410,7 +1574,7 @@ export default function Dashboard({ user, profile, setProfile }) {
               <div className="flex flex-col gap-6">
                 {!household ? (
                   <Card title="Household" description="Share a read-only spending view with one other person — budgets, income, and everything else stay private to each of you.">
-                    <form onSubmit={sendHouseholdInvite} className="flex gap-2 max-w-md mb-6">
+                    <form onSubmit={sendHouseholdInvite} className="flex gap-2 max-w-md mb-2">
                       <input
                         type="email"
                         value={inviteEmail}
@@ -1422,6 +1586,31 @@ export default function Dashboard({ user, profile, setProfile }) {
                         {sendingInvite ? 'Sending…' : 'Send invite'}
                       </button>
                     </form>
+                    <p className="text-xs text-slate-400 dark:text-slate-500 mb-6">
+                      They need an existing account. No email is sent — the invite appears in
+                      their own Household tab next time they open the app.
+                    </p>
+
+                    {sentInvites.length > 0 && (
+                      <div className="mb-6">
+                        <p className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-2">Waiting on a response</p>
+                        <div className="flex flex-col gap-2">
+                          {sentInvites.map(inv => (
+                            <div key={inv.id} className="flex items-center justify-between bg-gray-50 dark:bg-gray-800/60 border border-gray-200 dark:border-gray-700 rounded-lg px-4 py-2.5">
+                              <span className="text-sm text-navy dark:text-gray-200">
+                                Invite sent to {inv.toEmail}
+                              </span>
+                              <button
+                                onClick={() => cancelSentInvite(inv.id)}
+                                className="text-xs px-3 py-1 rounded-md border border-gray-300 dark:border-gray-700 text-slate-500 dark:text-slate-400 hover:bg-gray-100 dark:hover:bg-gray-800 transition shrink-0 ml-3"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
 
                     {householdInvites.length > 0 && (
                       <div>
@@ -1560,9 +1749,20 @@ export default function Dashboard({ user, profile, setProfile }) {
                 showToast={showToast}
                 categories={categories}
                 onCategoriesChanged={loadData}
-                baseTabs={BASE_TABS}
-                onTabsChanged={() => setTabs(loadTabs())}
+                baseTabs={BASE_TABS.filter(t => !t.adminOnly || isAdmin)}
+                onTabsChanged={() => setTabs(loadTabs(isAdmin))}
               />
+            )}
+
+            {/* Admin tab. Guarded by isAdmin here as well as by tab
+                filtering — but neither is the real protection; every
+                /api/admin/* route enforces requireAdmin server-side. */}
+            {activeTab === 'admin' && isAdmin && (
+              <Admin currentUid={user.uid} showToast={showToast} />
+            )}
+
+            {activeTab === 'analyze' && (
+              <DeepAnalysis showToast={showToast} />
             )}
               </motion.div>
             </AnimatePresence>
@@ -1572,7 +1772,10 @@ export default function Dashboard({ user, profile, setProfile }) {
 
       <ConfirmDialog
         open={!!confirmState}
+        title={confirmState?.title}
         message={confirmState?.message}
+        confirmLabel={confirmState?.confirmLabel}
+        variant={confirmState?.variant}
         onConfirm={confirmState?.onConfirm}
         onCancel={() => setConfirmState(null)}
       />
