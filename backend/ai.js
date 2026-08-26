@@ -3,25 +3,49 @@
 // could drift out of sync with what's actually running.
 
 import Groq from 'groq-sdk';
+import { logAiUsage } from './telemetry.js';
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const MODEL = 'openai/gpt-oss-120b'; // free-tier eligible (llama-3.3-70b-versatile was deprecated Aug 2026)
 
 export const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
 
-export async function callGroq(prompt, maxTokens = 300, extraOptions = {}) {
+// `feature` is only for telemetry — it labels which part of the app made
+// the call so token usage can be attributed. Logging happens here rather
+// than at each call site so no future AI feature can forget to do it.
+export async function callGroq(prompt, maxTokens = 300, extraOptions = {}, feature = 'unknown') {
   if (!groq) {
     throw new Error('GROQ_API_KEY is not set');
   }
 
-  const completion = await groq.chat.completions.create({
-    model: MODEL,
-    messages: [{ role: 'user', content: prompt }],
-    max_tokens: maxTokens,
-    ...extraOptions
-  });
+  try {
+    const completion = await groq.chat.completions.create({
+      model: MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: maxTokens,
+      ...extraOptions
+    });
 
-  return (completion.choices?.[0]?.message?.content || '').trim();
+    logAiUsage({
+      feature,
+      model: MODEL,
+      promptTokens: completion.usage?.prompt_tokens,
+      completionTokens: completion.usage?.completion_tokens,
+      ok: true
+    });
+
+    return (completion.choices?.[0]?.message?.content || '').trim();
+  } catch (err) {
+    // Rate limits are the failure mode that actually matters here — knowing
+    // the daily cap was hit (and when) is the whole point of this logging.
+    logAiUsage({
+      feature,
+      model: MODEL,
+      ok: false,
+      errorCode: err?.error?.error?.code || err?.code || 'unknown'
+    });
+    throw err;
+  }
 }
 
 // The categorizer the live app actually uses — returns a plain category
@@ -55,7 +79,7 @@ async function categorizeWithDetails(description, amount, categories, groqCaller
   const prompt = buildPrompt(description, amount, categories);
 
   try {
-    const result = (await groqCaller(prompt, 300, { temperature: 0 })).trim();
+    const result = (await groqCaller(prompt, 300, { temperature: 0 }, 'categorize')).trim();
     const match = categories.find(c => c.toLowerCase() === result.toLowerCase());
     return match ? { category: match, usedFallback: false } : { category: 'Other', usedFallback: true };
   } catch (err) {

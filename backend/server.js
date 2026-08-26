@@ -1,6 +1,11 @@
+// MUST be first: ES module imports are all evaluated before any statement
+// in this file runs, and ./ai.js and ./firestore.js both read process.env
+// at import time. Importing 'dotenv/config' (rather than calling
+// dotenv.config() further down) guarantees .env is loaded before they are.
+import 'dotenv/config';
+
 import express from 'express';
 import cors from 'cors';
-import dotenv from 'dotenv';
 import multer from 'multer';
 import pdfParse from 'pdf-parse';
 import { db, auth } from './firestore.js';
@@ -16,11 +21,24 @@ import {
   chunkStatementText
 } from './lib.js';
 import { groq, callGroq, categorize } from './ai.js';
-
-dotenv.config();
+import {
+  logError,
+  logFunnelStep,
+  logCategoryOverride,
+  getAiUsageStats,
+  getRecentErrors,
+  getFunnelStats,
+  getCategoryAccuracy
+} from './telemetry.js';
+import { runFinancialAgent, agentAvailable } from './agent.js';
 
 const app = express();
-app.use(cors());
+// In deployment, set FRONTEND_URL to the Vercel origin so only that site
+// can call this API from a browser. Left unset (local dev), CORS stays
+// open so localhost:5173 works without extra config.
+app.use(cors({
+  origin: process.env.FRONTEND_URL || true
+}));
 app.use(express.json());
 
 // PDF statement uploads: kept in memory only, never written to disk —
@@ -67,9 +85,60 @@ async function requireAuth(req, res, next) {
     req.profile = profileSnap.exists ? profileSnap.data() : {};
     req.categories = categoriesFor(req.profile.purpose, req.profile.customCategories || []);
 
+    // Activity tracking for admin analytics. Throttled to at most one write
+    // per hour per user — without this, every single API call would issue a
+    // Firestore write, which is both slow and needlessly expensive.
+    const nowIso = new Date().toISOString();
+    const lastActive = req.profile.lastActiveAt;
+    if (!lastActive || (Date.now() - new Date(lastActive).getTime()) > 60 * 60 * 1000) {
+      const update = { lastActiveAt: nowIso };
+      if (!req.profile.createdAt) update.createdAt = nowIso; // backfill for pre-existing accounts
+      req.userDocRef.set(update, { merge: true }).catch(() => {}); // never block the request
+    }
+
     next();
   } catch (err) {
     res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+// --- Admin authorization ---
+//
+// Runs AFTER requireAuth, so req.uid is already a verified token identity.
+// The role is read from Firestore server-side — never from anything the
+// client sends — so a user can't grant themselves admin by tampering with
+// a request body, header, or local state.
+//
+// There is deliberately no "make me an admin" endpoint. The first admin is
+// set by hand in the Firebase console (users/{uid}, add role: "admin"),
+// because any self-service path here would be the weakest link in the app.
+function requireAdmin(req, res, next) {
+  if (req.profile?.role !== 'admin') {
+    // Deliberately identical to a missing-resource response: a non-admin
+    // shouldn't be able to discover which admin endpoints exist.
+    return res.status(404).json({ error: 'Not found' });
+  }
+  next();
+}
+
+// Records every privileged read of another user's data. Admin analytics
+// (aggregate counts) don't need this — nothing identifiable is exposed —
+// but any endpoint that surfaces a specific person's financial records
+// writes an entry here first, so privileged access is always attributable
+// after the fact rather than invisible.
+async function logAdminAccess(adminUid, targetUid, action) {
+  try {
+    await db.collection('adminAuditLog').add({
+      adminUid,
+      targetUid,
+      action,
+      at: new Date().toISOString()
+    });
+  } catch (err) {
+    // Logging must not silently fail open — if we can't record the access,
+    // we don't perform it.
+    console.error('Admin audit log write failed:', err.message);
+    throw new Error('Audit logging unavailable');
   }
 }
 
@@ -91,7 +160,7 @@ Text: "${text}"
 Respond with ONLY valid JSON, no markdown fences, no explanation, in exactly this shape:
 {"description": "string", "amount": number, "date": "YYYY-MM-DD"}`;
 
-  const raw = await callGroq(prompt);
+  const raw = await callGroq(prompt, 300, {}, 'quick_add_parse');
   const cleaned = raw.replace(/```json|```/g, '').trim();
 
   let parsed;
@@ -138,13 +207,14 @@ ${chunkText}`;
   try {
     // 4000 output tokens + a ~3500-char chunk (~1000-1500 input tokens) +
     // prompt overhead stays comfortably under Groq's 8000-token combined cap.
-    raw = await callGroq(prompt, 4000, { reasoning_effort: 'low' });
+    raw = await callGroq(prompt, 4000, { reasoning_effort: 'low' }, 'statement_extract');
     const cleaned = raw.replace(/```json|```/g, '').trim();
     const parsed = JSON.parse(cleaned);
     if (!Array.isArray(parsed)) return [];
     return parsed.filter(t => t.date && t.description && typeof t.amount === 'number' && (t.type === 'debit' || t.type === 'credit'));
   } catch (err) {
     console.error('Statement chunk parsing failed:', err.message);
+    logError({ feature: 'statement_extract', message: err.message });
     if (typeof raw === 'string') {
       console.error('[import-pdf] redacted raw AI response (first 500 chars):', raw.slice(0, 500).replace(/\d/g, '#'));
     }
@@ -176,7 +246,7 @@ what they mean.
 Question: ${question}`;
 
   try {
-    const result = await callGroq(prompt);
+    const result = await callGroq(prompt, 300, {}, 'chat');
     return result || "I wasn't able to come up with an answer to that — could you try rephrasing?";
   } catch (err) {
     return `AI request failed: ${err.message}`;
@@ -201,7 +271,7 @@ ${lines}
 Write a short, friendly 1-2 sentence nudge mentioning the most urgent one(s) by name with specific numbers. Do not restate every category if there are several — focus on the most over-budget one. Be direct, not preachy.`;
 
   try {
-    return await callGroq(prompt);
+    return await callGroq(prompt, 300, {}, 'budget_nudge');
   } catch (err) {
     return null; // fail silently — progress bars still work without the nudge
   }
@@ -227,11 +297,15 @@ app.get('/api/profile', requireAuth, async (req, res) => {
     employmentType: req.profile.employmentType || null,
     jobTitle: req.profile.jobTitle || '',
     financialGoal: req.profile.financialGoal || null,
-    householdId: req.profile.householdId || null
+    householdId: req.profile.householdId || null,
+    role: req.profile.role || 'user'
   });
 });
 
 app.post('/api/profile', requireAuth, async (req, res) => {
+  // Deliberately an allowlist, not a spread of req.body. `role` is absent
+  // and must stay absent — accepting it here would let any user promote
+  // themselves to admin with a single crafted request.
   const {
     displayName, purpose, phoneNumber, budgetNudgeThreshold, photoURL, avatarEmoji,
     employmentType, jobTitle, financialGoal
@@ -469,6 +543,7 @@ const STATEMENT_TEMPLATES = [
 // is saved yet — the frontend shows this list for the user to review, edit,
 // and select before anything touches the database. See import-confirm below.
 app.post('/api/transactions/import-pdf', requireAuth, upload.single('statement'), async (req, res) => {
+  logFunnelStep({ feature: 'statement_import', step: 'started', uid: req.uid });
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded (expected field name "statement")' });
   }
@@ -560,7 +635,10 @@ app.post('/api/transactions/import-pdf', requireAuth, upload.single('statement')
 // Step 2: the user has reviewed/edited/selected rows from step 1 — this
 // actually creates them. Nothing here calls AI; it's a plain bulk insert.
 app.post('/api/transactions/import-confirm', requireAuth, async (req, res) => {
-  const { transactions } = req.body;
+  // `source` is optional and only used for funnel attribution — both the
+  // PDF and receipt wizards share this endpoint, so without it the two
+  // flows would be indistinguishable in the drop-off stats.
+  const { transactions, source } = req.body;
   if (!Array.isArray(transactions) || transactions.length === 0) {
     return res.status(400).json({ error: 'transactions must be a non-empty array' });
   }
@@ -577,7 +655,44 @@ app.post('/api/transactions/import-confirm', requireAuth, async (req, res) => {
     created++;
   }
 
+  logFunnelStep({
+    feature: source === 'receipt' ? 'receipt_import' : 'statement_import',
+    step: 'confirmed',
+    uid: req.uid
+  });
+
   res.json({ created });
+});
+
+// Changing a transaction's category. Beyond being useful on its own, this
+// is the app's real-world accuracy signal for categorization: when a user
+// corrects a category the AI assigned, that's a production miss on a real
+// transaction description — messier and more honest than any hand-written
+// eval set. Logged for the admin accuracy view.
+app.patch('/api/transactions/:id', requireAuth, async (req, res) => {
+  const { category } = req.body;
+  if (!category || !req.categories.includes(category)) {
+    return res.status(400).json({ error: 'A valid category is required' });
+  }
+
+  const docRef = req.transactionsRef.doc(req.params.id);
+  const snap = await docRef.get();
+  if (!snap.exists) {
+    return res.status(404).json({ error: 'Transaction not found' });
+  }
+
+  const existing = snap.data();
+  if (existing.category !== category) {
+    logCategoryOverride({
+      uid: req.uid,
+      description: existing.description,
+      aiCategory: existing.category,
+      userCategory: category
+    });
+  }
+
+  await docRef.update({ category });
+  res.json({ id: req.params.id, ...existing, category });
 });
 
 app.delete('/api/transactions/:id', requireAuth, async (req, res) => {
@@ -688,7 +803,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     req.transactionsRef.orderBy('date', 'desc').get(),
     req.incomeRef.get(),
     req.savingsRef.get(),
-    req.chatRef.orderBy('createdAt', 'desc').limit(6).get() // last 3 Q&A pairs
+    req.chatRef.orderBy('createdAt', 'desc').limit(6).get() // last 6 Q&A exchanges
   ]);
 
   const summary = txSnapshot.docs
@@ -1029,7 +1144,7 @@ Write one or two short, plain-language sentences explaining what these numbers m
 Use these exact numbers — do not recalculate or estimate anything yourself.`;
 
   try {
-    const narrative = await callGroq(prompt, 300);
+    const narrative = await callGroq(prompt, 300, {}, 'predict_narrate');
     res.json({ narrative });
   } catch (err) {
     res.json({ narrative: null });
@@ -1040,6 +1155,31 @@ Use these exact numbers — do not recalculate or estimate anything yourself.`;
 // Every component score is computed deterministically from real data.
 // AI's only job is a short encouragement + tip sentence at the end, using
 // the exact scores already calculated — never asked to grade anything itself.
+
+// --- Deep analysis (agentic) ---
+// Unlike /chat, which makes one Groq call with a pre-assembled context,
+// this hands a reasoning model a set of deterministic tools and lets it
+// decide what to investigate. See agent.js for why a second provider.
+
+app.post('/api/analyze', requireAuth, async (req, res) => {
+  const { question } = req.body;
+  if (!question || !question.trim()) {
+    return res.status(400).json({ error: 'question is required' });
+  }
+  if (!agentAvailable) {
+    return res.status(503).json({ error: 'Deep analysis is not configured — set OPENROUTER_API_KEY on the backend.' });
+  }
+
+  try {
+    const result = await runFinancialAgent(question.trim(), req);
+    res.json(result);
+  } catch (err) {
+    if (err.status === 429) {
+      return res.status(429).json({ error: "Deep analysis has hit today's free-tier limit. Regular chat still works." });
+    }
+    res.status(502).json({ error: "The analysis didn't complete. Try again in a moment." });
+  }
+});
 
 app.get('/api/health-score', requireAuth, async (req, res) => {
   const months = lastNMonths(3);
@@ -1057,14 +1197,40 @@ app.get('/api/health-score', requireAuth, async (req, res) => {
   const incomeEntries = incomeSnapshot.docs.map(d => d.data());
   const savingsEntries = savingsSnapshot.docs.map(d => d.data());
 
+  // A brand-new account has no spending, which makes variance zero — which
+  // the consistency formula reads as "perfectly consistent" and awards a
+  // full 30/30 for. Combined with the neutral budget default, that hands
+  // out 45 points for having done nothing, and then has the AI congratulate
+  // the user on it. Refuse to score at all until there's something to
+  // measure; an honest "not yet" beats a flattering fiction.
+  const missing = [];
+  if (transactions.length === 0) missing.push('some transactions');
+  if (incomeEntries.length === 0) missing.push('your income');
+
+  if (missing.length > 0) {
+    return res.json({
+      insufficientData: true,
+      missing,
+      message: `Add ${missing.join(' and ')} and your score will appear here.`
+    });
+  }
+
   // Spending consistency (0-30): lower month-to-month variance = higher score.
-  const monthlySpends = months.map(({ month }) =>
-    transactions.filter(t => t.date.startsWith(month)).reduce((s, t) => s + t.amount, 0)
-  );
-  const avgSpend = monthlySpends.reduce((s, v) => s + v, 0) / monthlySpends.length || 0;
-  const variance = monthlySpends.reduce((s, v) => s + Math.pow(v - avgSpend, 2), 0) / monthlySpends.length || 0;
-  const coefficientOfVariation = avgSpend > 0 ? Math.sqrt(variance) / avgSpend : 0;
-  const consistencyScore = Math.max(0, Math.min(30, 30 - coefficientOfVariation * 60));
+  // Only months that actually have data count — otherwise a new account's
+  // empty back-months would drag an active user's variance around.
+  const monthlySpends = months
+    .map(({ month }) => transactions.filter(t => t.date.startsWith(month)).reduce((s, t) => s + t.amount, 0))
+    .filter(total => total > 0);
+
+  // With fewer than two months of real spending there's no variance to
+  // measure yet, so award the neutral midpoint rather than a perfect score.
+  let consistencyScore = 15;
+  if (monthlySpends.length >= 2) {
+    const avgSpend = monthlySpends.reduce((s, v) => s + v, 0) / monthlySpends.length;
+    const variance = monthlySpends.reduce((s, v) => s + Math.pow(v - avgSpend, 2), 0) / monthlySpends.length;
+    const coefficientOfVariation = avgSpend > 0 ? Math.sqrt(variance) / avgSpend : 0;
+    consistencyScore = Math.max(0, Math.min(30, 30 - coefficientOfVariation * 60));
+  }
 
   // Savings rate (0-40): % of this month's income actually saved.
   const activeIncome = incomeInEffectOn(incomeEntries, today);
@@ -1098,7 +1264,7 @@ app.get('/api/health-score', requireAuth, async (req, res) => {
 Write one short, encouraging sentence naming their strongest area, then one practical tip for
 their weakest area. Use only the numbers given — do not recalculate anything.`;
     try {
-      tip = await callGroq(prompt, 200);
+      tip = await callGroq(prompt, 200, {}, 'health_score_tip');
     } catch (err) {
       tip = null;
     }
@@ -1148,9 +1314,25 @@ app.post('/api/household/invite', requireAuth, async (req, res) => {
     return res.status(400).json({ error: "You can't invite yourself." });
   }
 
+  // Email lives in Firebase Auth, not the Firestore profile doc — reading
+  // it off req.profile silently produced null on every invite.
+  const inviter = await auth.getUser(req.uid).catch(() => null);
+
+  // Don't stack duplicates — re-inviting the same person should be a no-op
+  // rather than filling their list with identical pending invites.
+  const existing = await db.collection('householdInvites')
+    .where('fromUid', '==', req.uid)
+    .where('toUid', '==', targetUser.uid)
+    .where('status', '==', 'pending')
+    .get();
+
+  if (!existing.empty) {
+    return res.status(200).json({ id: existing.docs[0].id, alreadyPending: true });
+  }
+
   const inviteRef = await db.collection('householdInvites').add({
     fromUid: req.uid,
-    fromEmail: req.profile.email || null,
+    fromEmail: inviter?.email || null,
     fromName: req.profile.displayName || null,
     toUid: targetUser.uid,
     toEmail: targetUser.email,
@@ -1162,11 +1344,27 @@ app.post('/api/household/invite', requireAuth, async (req, res) => {
 });
 
 app.get('/api/household/invites', requireAuth, async (req, res) => {
-  const snapshot = await db.collection('householdInvites')
-    .where('toUid', '==', req.uid)
-    .where('status', '==', 'pending')
-    .get();
-  res.json(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
+  const [receivedSnap, sentSnap] = await Promise.all([
+    db.collection('householdInvites').where('toUid', '==', req.uid).where('status', '==', 'pending').get(),
+    db.collection('householdInvites').where('fromUid', '==', req.uid).where('status', '==', 'pending').get()
+  ]);
+
+  res.json({
+    received: receivedSnap.docs.map(d => ({ id: d.id, ...d.data() })),
+    // Without this the sender gets no feedback that the invite exists —
+    // it just silently sits in the recipient's tab.
+    sent: sentSnap.docs.map(d => ({ id: d.id, ...d.data() }))
+  });
+});
+
+app.delete('/api/household/invites/:id', requireAuth, async (req, res) => {
+  const inviteRef = db.collection('householdInvites').doc(req.params.id);
+  const snap = await inviteRef.get();
+  if (!snap.exists) return res.status(404).json({ error: 'Invite not found' });
+  if (snap.data().fromUid !== req.uid) return res.status(403).json({ error: 'Not your invite' });
+
+  await inviteRef.delete();
+  res.status(204).end();
 });
 
 app.post('/api/household/invites/:id/accept', requireAuth, async (req, res) => {
@@ -1177,19 +1375,46 @@ app.post('/api/household/invites/:id/accept', requireAuth, async (req, res) => {
   const invite = inviteSnap.data();
   if (invite.toUid !== req.uid) return res.status(403).json({ error: 'Not your invite' });
   if (invite.status !== 'pending') return res.status(400).json({ error: 'Invite already handled' });
+  if (req.profile.householdId) {
+    return res.status(400).json({ error: "You're already in a household — leave it before joining another." });
+  }
 
-  const householdRef = await db.collection('households').add({
-    members: [invite.fromUid, invite.toUid],
-    createdAt: new Date().toISOString()
-  });
+  const inviterSnap = await db.collection('users').doc(invite.fromUid).get();
+  const existingHouseholdId = inviterSnap.data()?.householdId || null;
+
+  let householdId;
+
+  if (existingHouseholdId) {
+    // The inviter is already in a household — join THAT one rather than
+    // creating a second one, which would silently orphan the original.
+    const householdRef = db.collection('households').doc(existingHouseholdId);
+    const householdSnap = await householdRef.get();
+
+    if (!householdSnap.exists) {
+      return res.status(404).json({ error: 'That household no longer exists.' });
+    }
+    const members = householdSnap.data().members || [];
+    if (members.length >= MAX_HOUSEHOLD_MEMBERS) {
+      return res.status(400).json({ error: `That household is full (${MAX_HOUSEHOLD_MEMBERS} members max).` });
+    }
+
+    await householdRef.update({ members: [...members, req.uid] });
+    householdId = existingHouseholdId;
+  } else {
+    const householdRef = await db.collection('households').add({
+      members: [invite.fromUid, invite.toUid],
+      createdAt: new Date().toISOString()
+    });
+    await db.collection('users').doc(invite.fromUid).set({ householdId: householdRef.id }, { merge: true });
+    householdId = householdRef.id;
+  }
 
   await Promise.all([
     inviteRef.update({ status: 'accepted' }),
-    db.collection('users').doc(invite.fromUid).set({ householdId: householdRef.id }, { merge: true }),
-    db.collection('users').doc(invite.toUid).set({ householdId: householdRef.id }, { merge: true })
+    db.collection('users').doc(req.uid).set({ householdId }, { merge: true })
   ]);
 
-  res.json({ householdId: householdRef.id });
+  res.json({ householdId });
 });
 
 app.post('/api/household/invites/:id/decline', requireAuth, async (req, res) => {
@@ -1233,23 +1458,31 @@ app.delete('/api/household/leave', requireAuth, async (req, res) => {
   const householdRef = db.collection('households').doc(req.profile.householdId);
   const householdSnap = await householdRef.get();
 
-  if (householdSnap.exists) {
-    const { members } = householdSnap.data();
-    const otherMember = members.find(uid => uid !== req.uid);
-    await Promise.all([
-      householdRef.delete(),
-      db.collection('users').doc(req.uid).set({ householdId: null }, { merge: true }),
-      otherMember ? db.collection('users').doc(otherMember).set({ householdId: null }, { merge: true }) : Promise.resolve()
-    ]);
-  } else {
+  if (!householdSnap.exists) {
     await db.collection('users').doc(req.uid).set({ householdId: null }, { merge: true });
+    return res.status(204).end();
   }
 
+  // Previously this deleted the whole household and evicted "the other
+  // member" — which was survivable with exactly two people but would
+  // dissolve the group for everyone once there are more. Now leaving
+  // removes only the person leaving; the household is deleted only when
+  // the last member walks out.
+  const remaining = (householdSnap.data().members || []).filter(uid => uid !== req.uid);
+
+  if (remaining.length === 0) {
+    await householdRef.delete();
+  } else {
+    await householdRef.update({ members: remaining });
+  }
+
+  await db.collection('users').doc(req.uid).set({ householdId: null }, { merge: true });
   res.status(204).end();
 });
 
-// Combined current-month category spending across both household members,
-// plus a simple 50/50 settle-up: who owes whom to make this month even.
+// Current-month spending per household member. Read-only: each member's
+// own transactions stay theirs, this only aggregates totals and category
+// breakdowns for a shared view.
 app.get('/api/household/spending', requireAuth, async (req, res) => {
   if (!req.profile.householdId) {
     return res.status(400).json({ error: 'Not in a household' });
@@ -1276,25 +1509,428 @@ app.get('/api/household/spending', requireAuth, async (req, res) => {
     const total = transactions.reduce((sum, t) => sum + t.amount, 0);
     const byCategory = {};
     transactions.forEach(t => { byCategory[t.category] = (byCategory[t.category] || 0) + t.amount; });
+
+    // Most recent few, so the shared view shows activity rather than just
+    // a bar height. Amount + category + date only — no merchant detail.
+    const recent = transactions
+      .sort((a, b) => (a.date < b.date ? 1 : -1))
+      .slice(0, 3)
+      .map(t => ({ date: t.date, category: t.category, amount: t.amount }));
+
     return {
       uid,
       displayName: profileSnap.data()?.displayName || 'Member',
       total,
-      byCategory
+      byCategory,
+      recent
     };
   }));
 
   const combinedTotal = memberSpending.reduce((sum, m) => sum + m.total, 0);
-  const fairShare = combinedTotal / memberSpending.length;
 
-  const settleUp = memberSpending.map(m => ({
-    uid: m.uid,
-    displayName: m.displayName,
-    spent: m.total,
-    balance: m.total - fairShare // positive = they overpaid, owed money; negative = they owe
+  res.json({ memberSpending, combinedTotal });
+});
+
+// --- Shared household bills ---
+// A list the household maintains together, separate from anyone's personal
+// recurring transactions. Deliberately not derived from those: a shared
+// hydro bill is a household fact, and shouldn't depend on one member
+// having set it up privately (or disappear if they leave).
+
+const HOUSEHOLD_MAX_MEMBERS = 10;
+
+async function requireHouseholdMember(req, res) {
+  if (!req.profile.householdId) {
+    res.status(400).json({ error: 'Not in a household' });
+    return null;
+  }
+  const ref = db.collection('households').doc(req.profile.householdId);
+  const snap = await ref.get();
+  if (!snap.exists) {
+    res.status(404).json({ error: 'Household not found' });
+    return null;
+  }
+  if (!(snap.data().members || []).includes(req.uid)) {
+    res.status(403).json({ error: 'Not a member of this household' });
+    return null;
+  }
+  return { ref, data: snap.data() };
+}
+
+app.get('/api/household/bills', requireAuth, async (req, res) => {
+  const household = await requireHouseholdMember(req, res);
+  if (!household) return;
+
+  const snapshot = await household.ref.collection('bills').orderBy('dueDate', 'asc').get();
+  res.json(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
+});
+
+app.post('/api/household/bills', requireAuth, async (req, res) => {
+  const household = await requireHouseholdMember(req, res);
+  if (!household) return;
+
+  const { name, amount, dueDate, splitBetween } = req.body;
+  if (!name || !name.trim() || amount === undefined || !dueDate) {
+    return res.status(400).json({ error: 'name, amount, and dueDate are required' });
+  }
+
+  // Default to splitting across everyone; an explicit list lets a bill be
+  // shared by only some members (e.g. only the two people with parking).
+  const members = household.data.members || [];
+  const split = Array.isArray(splitBetween) && splitBetween.length > 0
+    ? splitBetween.filter(uid => members.includes(uid))
+    : members;
+
+  const bill = {
+    name: name.trim(),
+    amount: Number(amount),
+    dueDate,
+    splitBetween: split,
+    paid: false,
+    addedBy: req.uid,
+    createdAt: new Date().toISOString()
+  };
+
+  const docRef = await household.ref.collection('bills').add(bill);
+  res.status(201).json({ id: docRef.id, ...bill });
+});
+
+app.post('/api/household/bills/:id/paid', requireAuth, async (req, res) => {
+  const household = await requireHouseholdMember(req, res);
+  if (!household) return;
+
+  const { paid } = req.body;
+  await household.ref.collection('bills').doc(req.params.id).update({ paid: !!paid });
+  res.json({ id: req.params.id, paid: !!paid });
+});
+
+app.delete('/api/household/bills/:id', requireAuth, async (req, res) => {
+  const household = await requireHouseholdMember(req, res);
+  if (!household) return;
+
+  await household.ref.collection('bills').doc(req.params.id).delete();
+  res.status(204).end();
+});
+
+// --- Household chat ---
+// Plain messages between members. Not AI-backed — this is people talking
+// to each other about shared costs, which doesn't need a model involved.
+
+app.get('/api/household/messages', requireAuth, async (req, res) => {
+  const household = await requireHouseholdMember(req, res);
+  if (!household) return;
+
+  const snapshot = await household.ref.collection('messages')
+    .orderBy('at', 'desc').limit(100).get();
+
+  // Reverse so the client renders oldest-first without re-sorting.
+  res.json(snapshot.docs.map(d => ({ id: d.id, ...d.data() })).reverse());
+});
+
+app.post('/api/household/messages', requireAuth, async (req, res) => {
+  const household = await requireHouseholdMember(req, res);
+  if (!household) return;
+
+  const { text } = req.body;
+  if (!text || !text.trim()) {
+    return res.status(400).json({ error: 'text is required' });
+  }
+
+  const message = {
+    text: text.trim().slice(0, 1000),
+    fromUid: req.uid,
+    fromName: req.profile.displayName || 'Member',
+    at: new Date().toISOString()
+  };
+
+  const docRef = await household.ref.collection('messages').add(message);
+  res.status(201).json({ id: docRef.id, ...message });
+});
+
+// --- Admin ---
+// Every route below is requireAuth + requireAdmin. See requireAdmin above
+// for why the role is read server-side only.
+
+// (A) Aggregate analytics. Reads counts and metadata only — deliberately
+// never reads transaction contents, amounts, or descriptions, so even a
+// bug here can't leak anyone's actual finances.
+app.get('/api/admin/analytics', requireAuth, requireAdmin, async (req, res) => {
+  const usersSnapshot = await db.collection('users').get();
+
+  const now = new Date();
+  const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+  let totalTransactions = 0;
+  let usersWithIncome = 0;
+  let usersWithBudgets = 0;
+  let usersWithRecurring = 0;
+  let usersInHousehold = 0;
+  let activeThisWeek = 0;
+  const purposeBreakdown = {};
+  const signupsByDay = {};
+
+  for (const doc of usersSnapshot.docs) {
+    const profile = doc.data();
+
+    if (profile.purpose) {
+      purposeBreakdown[profile.purpose] = (purposeBreakdown[profile.purpose] || 0) + 1;
+    }
+    if (profile.householdId) usersInHousehold++;
+
+    if (profile.createdAt) {
+      const day = profile.createdAt.slice(0, 10);
+      if (profile.createdAt >= thirtyDaysAgo) {
+        signupsByDay[day] = (signupsByDay[day] || 0) + 1;
+      }
+    }
+    if (profile.lastActiveAt && profile.lastActiveAt >= weekAgo) activeThisWeek++;
+
+    // Counts only — .size never exposes document contents.
+    const [txSnap, incomeSnap, budgetsSnap, recurringSnap] = await Promise.all([
+      doc.ref.collection('transactions').get(),
+      doc.ref.collection('income').get(),
+      doc.ref.collection('budgets').get(),
+      doc.ref.collection('recurring').get()
+    ]);
+
+    totalTransactions += txSnap.size;
+    if (incomeSnap.size > 0) usersWithIncome++;
+    if (budgetsSnap.size > 0) usersWithBudgets++;
+    if (recurringSnap.size > 0) usersWithRecurring++;
+  }
+
+  res.json({
+    totalUsers: usersSnapshot.size,
+    activeThisWeek,
+    totalTransactions,
+    avgTransactionsPerUser: usersSnapshot.size > 0 ? Math.round(totalTransactions / usersSnapshot.size) : 0,
+    featureAdoption: {
+      income: usersWithIncome,
+      budgets: usersWithBudgets,
+      recurring: usersWithRecurring,
+      household: usersInHousehold
+    },
+    purposeBreakdown,
+    signupsByDay
+  });
+});
+
+// (B) Account management. Returns account-level metadata and activity
+// counts — never transaction contents. Enough to help someone with a
+// login or account problem, not enough to see what they spend money on.
+app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
+  const usersSnapshot = await db.collection('users').get();
+
+  const users = await Promise.all(usersSnapshot.docs.map(async doc => {
+    const profile = doc.data();
+    const authUser = await auth.getUser(doc.id).catch(() => null);
+    const [txSnap, savingsSnap] = await Promise.all([
+      doc.ref.collection('transactions').get(),
+      doc.ref.collection('savings').get()
+    ]);
+
+    return {
+      uid: doc.id,
+      email: authUser?.email || null,
+      displayName: profile.displayName || null,
+      purpose: profile.purpose || null,
+      role: profile.role || 'user',
+      disabled: authUser?.disabled ?? false,
+      createdAt: authUser?.metadata?.creationTime || null,
+      lastSignIn: authUser?.metadata?.lastSignInTime || null,
+      transactionCount: txSnap.size,
+      savingsCount: savingsSnap.size,
+      inHousehold: !!profile.householdId
+    };
   }));
 
-  res.json({ memberSpending, combinedTotal, settleUp });
+  res.json(users);
+});
+
+app.post('/api/admin/users/:uid/disable', requireAuth, requireAdmin, async (req, res) => {
+  const { disabled } = req.body;
+  if (req.params.uid === req.uid) {
+    return res.status(400).json({ error: "You can't disable your own admin account." });
+  }
+  try {
+    await auth.updateUser(req.params.uid, { disabled: !!disabled });
+    await logAdminAccess(req.uid, req.params.uid, disabled ? 'disable_account' : 'enable_account');
+    res.json({ uid: req.params.uid, disabled: !!disabled });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/admin/users/:uid/reset-password', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const authUser = await auth.getUser(req.params.uid);
+    // Generates a link rather than setting a password directly — the admin
+    // never learns or chooses the user's new credentials.
+    const link = await auth.generatePasswordResetLink(authUser.email);
+    await logAdminAccess(req.uid, req.params.uid, 'generate_password_reset');
+    res.json({ link });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// (C) Privileged read of a specific user's financial data, for debugging
+// reports like "the import mangled my statement".
+//
+// This is the one endpoint that exposes another person's actual
+// transactions, so the audit entry is written BEFORE the data is read —
+// if logging fails, the request fails and no data is returned. Access is
+// always attributable after the fact.
+app.get('/api/admin/users/:uid/transactions', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    await logAdminAccess(req.uid, req.params.uid, 'view_transactions');
+  } catch (err) {
+    return res.status(503).json({ error: 'Audit logging is unavailable, so this request was refused.' });
+  }
+
+  const snapshot = await db.collection('users').doc(req.params.uid)
+    .collection('transactions').orderBy('date', 'desc').limit(100).get();
+
+  res.json(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
+});
+
+// The audit log itself, so privileged access can be reviewed.
+// Operational observability. Aggregates only — except category overrides,
+// which include transaction descriptions by design (they're the accuracy
+// signal itself). No amounts or balances are exposed here.
+app.get('/api/admin/observability', requireAuth, requireAdmin, async (req, res) => {
+  const [aiUsage, errors, funnels, accuracy] = await Promise.all([
+    getAiUsageStats(7),
+    getRecentErrors(50),
+    getFunnelStats(30),
+    getCategoryAccuracy(30)
+  ]);
+
+  res.json({
+    aiUsage,
+    errors,
+    funnels,
+    accuracy,
+    // Groq's documented free-tier ceiling, so the UI can show usage
+    // against the actual limit rather than an unlabelled number.
+    dailyTokenLimit: 200000,      // Groq free tier: tokens/day
+    dailyRequestLimit: 200        // OpenRouter free tier: requests/day
+  });
+});
+
+// --- Admin actions (group 2) ---
+
+// Promote/demote admins. Guarded so the last admin can't be removed —
+// otherwise a single misclick locks everyone out of admin permanently,
+// recoverable only by hand-editing Firestore.
+app.post('/api/admin/users/:uid/role', requireAuth, requireAdmin, async (req, res) => {
+  const { role } = req.body;
+  if (!['user', 'admin'].includes(role)) {
+    return res.status(400).json({ error: "role must be 'user' or 'admin'" });
+  }
+
+  if (role === 'user') {
+    const adminsSnapshot = await db.collection('users').where('role', '==', 'admin').get();
+    if (adminsSnapshot.size <= 1) {
+      return res.status(400).json({ error: "Can't demote the last admin — promote someone else first." });
+    }
+  }
+
+  await db.collection('users').doc(req.params.uid).set({ role }, { merge: true });
+  await logAdminAccess(req.uid, req.params.uid, `set_role_${role}`);
+  res.json({ uid: req.params.uid, role });
+});
+
+// App-wide settings: broadcast banner and signup gating. Kept in a single
+// document so the public read below is one cheap fetch.
+const APP_SETTINGS_DOC = () => db.collection('appSettings').doc('global');
+
+app.get('/api/admin/settings', requireAuth, requireAdmin, async (req, res) => {
+  const snap = await APP_SETTINGS_DOC().get();
+  const data = snap.exists ? snap.data() : {};
+  res.json({
+    broadcastMessage: data.broadcastMessage || '',
+    signupsEnabled: data.signupsEnabled !== false
+  });
+});
+
+app.post('/api/admin/settings', requireAuth, requireAdmin, async (req, res) => {
+  const { broadcastMessage, signupsEnabled } = req.body;
+  const update = {};
+  if (broadcastMessage !== undefined) update.broadcastMessage = String(broadcastMessage).slice(0, 300);
+  if (signupsEnabled !== undefined) update.signupsEnabled = !!signupsEnabled;
+
+  await APP_SETTINGS_DOC().set(update, { merge: true });
+  res.json(update);
+});
+
+// Read-only, unauthenticated: the login page needs to know whether signups
+// are open before anyone has an account, and every logged-in user needs the
+// broadcast banner. Exposes nothing sensitive.
+app.get('/api/public-settings', async (req, res) => {
+  if (!db) return res.json({ broadcastMessage: '', signupsEnabled: true });
+  const snap = await APP_SETTINGS_DOC().get();
+  const data = snap.exists ? snap.data() : {};
+  res.json({
+    broadcastMessage: data.broadcastMessage || '',
+    signupsEnabled: data.signupsEnabled !== false
+  });
+});
+
+// All users as CSV. Account metadata and counts only — same boundary as the
+// users table, so this can't become a backdoor around it.
+app.get('/api/admin/users/export', requireAuth, requireAdmin, async (req, res) => {
+  const usersSnapshot = await db.collection('users').get();
+
+  const rows = await Promise.all(usersSnapshot.docs.map(async doc => {
+    const profile = doc.data();
+    const authUser = await auth.getUser(doc.id).catch(() => null);
+    const txSnap = await doc.ref.collection('transactions').get();
+    return {
+      uid: doc.id,
+      email: authUser?.email || '',
+      displayName: profile.displayName || '',
+      purpose: profile.purpose || '',
+      role: profile.role || 'user',
+      disabled: authUser?.disabled ? 'yes' : 'no',
+      createdAt: authUser?.metadata?.creationTime || '',
+      lastSignIn: authUser?.metadata?.lastSignInTime || '',
+      transactionCount: txSnap.size
+    };
+  }));
+
+  const headers = Object.keys(rows[0] || { uid: '' });
+  const escape = (v) => `"${String(v).replace(/"/g, '""')}"`; // CSV-safe
+  const csv = [
+    headers.join(','),
+    ...rows.map(r => headers.map(h => escape(r[h])).join(','))
+  ].join('\n');
+
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="users-${new Date().toISOString().slice(0, 10)}.csv"`);
+  res.send(csv);
+});
+
+app.get('/api/admin/audit-log', requireAuth, requireAdmin, async (req, res) => {
+  const snapshot = await db.collection('adminAuditLog')
+    .orderBy('at', 'desc').limit(100).get();
+
+  const entries = await Promise.all(snapshot.docs.map(async d => {
+    const entry = d.data();
+    const [adminUser, targetUser] = await Promise.all([
+      auth.getUser(entry.adminUid).catch(() => null),
+      auth.getUser(entry.targetUid).catch(() => null)
+    ]);
+    return {
+      id: d.id,
+      ...entry,
+      adminEmail: adminUser?.email || entry.adminUid,
+      targetEmail: targetUser?.email || entry.targetUid
+    };
+  }));
+
+  res.json(entries);
 });
 
 // --- Receipt OCR ---
@@ -1304,6 +1940,7 @@ app.get('/api/household/spending', requireAuth, async (req, res) => {
 // route (shared with the PDF import flow — no new confirm endpoint needed).
 
 app.post('/api/transactions/receipt', requireAuth, upload.single('receipt'), async (req, res) => {
+  logFunnelStep({ feature: 'receipt_import', step: 'started', uid: req.uid });
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded (expected field name "receipt")' });
   }
@@ -1367,6 +2004,7 @@ If you can't read any items clearly, respond with {"merchant": null, "date": "${
     res.json({ merchant: parsed.merchant || null, transactions: proposed });
   } catch (err) {
     console.error('Receipt OCR failed:', err.message);
+    logError({ feature: 'receipt_ocr', message: err.message, uid: req.uid });
     res.status(422).json({ error: "Couldn't read that receipt — try a clearer, well-lit photo." });
   }
 });
@@ -1379,6 +2017,7 @@ app.use((err, req, res, next) => {
   }
   if (err) {
     console.error(err);
+    logError({ feature: 'unhandled', message: err.message || String(err), uid: req.uid });
     return res.status(500).json({ error: 'Something went wrong processing that request.' });
   }
   next();
@@ -1388,6 +2027,9 @@ app.listen(PORT, () => {
   console.log(`Finance tracker backend running on http://localhost:${PORT}`);
   if (!groq) {
     console.warn('⚠️  GROQ_API_KEY is not set — AI categorization and chat will fall back to defaults.');
+  }
+  if (!agentAvailable) {
+    console.warn('⚠️  OPENROUTER_API_KEY is not set — deep analysis is disabled (everything else works).');
   }
   if (!db) {
     console.warn('⚠️  Firestore is not configured — see README for setup.');

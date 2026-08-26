@@ -1,5 +1,21 @@
-export default function ConfirmDialog({ open, title = 'Are you sure?', message, onConfirm, onCancel }) {
+// Defaults to a destructive "Delete" confirm, since that's the most common
+// use — but the label and colour are overridable. A red "Delete" button on
+// a non-destructive action (e.g. "view this data") is genuinely misleading,
+// so anything that isn't a deletion should pass its own confirmLabel.
+export default function ConfirmDialog({
+  open,
+  title = 'Are you sure?',
+  message,
+  confirmLabel = 'Delete',
+  variant = 'danger', // 'danger' | 'primary'
+  onConfirm,
+  onCancel
+}) {
   if (!open) return null
+
+  const confirmClass = variant === 'danger'
+    ? 'bg-red-500 hover:bg-red-600 text-white'
+    : 'bg-mint hover:brightness-95 text-navy'
 
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 px-4">
@@ -15,9 +31,9 @@ export default function ConfirmDialog({ open, title = 'Are you sure?', message, 
           </button>
           <button
             onClick={onConfirm}
-            className="px-4 py-2 rounded-lg bg-red-500 text-white text-sm font-medium hover:bg-red-600 transition"
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition ${confirmClass}`}
           >
-            Delete
+            {confirmLabel}
           </button>
         </div>
       </div>
