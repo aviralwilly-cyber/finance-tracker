@@ -2,20 +2,32 @@ import admin from 'firebase-admin';
 import fs from 'fs';
 import path from 'path';
 
+
+
 const KEY_PATH = path.resolve('./serviceAccountKey.json');
 
 let db = null;
 let auth = null;
+let serviceAccount = null;
 
-if (fs.existsSync(KEY_PATH)) {
-  const serviceAccount = JSON.parse(fs.readFileSync(KEY_PATH, 'utf8'));
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  try {
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  } catch (err) {
+    console.error('⚠️  FIREBASE_SERVICE_ACCOUNT is set but is not valid JSON.');
+  }
+} else if (fs.existsSync(KEY_PATH)) {
+  serviceAccount = JSON.parse(fs.readFileSync(KEY_PATH, 'utf8'));
+}
+
+if (serviceAccount) {
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
   });
   db = admin.firestore();
   auth = admin.auth();
 } else {
-  console.warn('⚠️  serviceAccountKey.json not found — Firestore is not configured. See README for setup.');
+  console.warn('⚠️  No Firebase credentials found — Firestore is not configured. See README for setup.');
 }
 
 export { db, auth };
