@@ -102,6 +102,7 @@ export default function Login() {
           minHeight: '100vh',
           width: '100%',
           display: 'flex',
+          flexDirection: 'column',
           alignItems: 'center',
           justifyContent: 'center',
           padding: '1rem'
@@ -196,6 +197,25 @@ export default function Login() {
             )}
           </p>
         </div>
+
+        {/* Attribution — stacked below the card rather than pinned to the
+            viewport bottom, so it can't collide with the card on short
+            screens or when the form changes height between modes. */}
+        <p
+          style={{
+            marginTop: '1.5rem',
+            marginBottom: 0,
+            fontSize: 12,
+            lineHeight: 1.6,
+            textAlign: 'center',
+            fontFamily: 'system-ui, sans-serif',
+            color: theme.subtext
+          }}
+        >
+          Built and designed by Aviral Abel Willy.
+          <br />
+          &copy; {new Date().getFullYear()} All rights reserved.
+        </p>
       </div>
     </div>
   )

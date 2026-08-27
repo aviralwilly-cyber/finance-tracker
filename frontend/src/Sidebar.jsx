@@ -85,6 +85,29 @@ export default function Sidebar({ tabs, activeTab, setActiveTab, userEmail, user
     </nav>
   )
 
+  // Attribution + copyright notice. Sits below the nav (which is flex-1, so
+  // it gets pushed to the bottom of the rail) and above the account block.
+  // At w-16 two lines of text would wrap into a mess, so the collapsed state
+  // degrades to a bare © with the full notice as a tooltip.
+  const Credit = ({ compact }) => (
+    <div
+      className={`px-4 py-3 border-t border-gray-200 dark:border-gray-800 text-center text-slate-400 dark:text-slate-500 ${
+        compact ? 'text-[10px]' : 'text-[11px] leading-relaxed'
+      }`}
+    >
+      {compact ? (
+        <p title={`Built and designed by Aviral Abel Willy. © ${new Date().getFullYear()} All rights reserved.`}>
+          &copy;
+        </p>
+      ) : (
+        <>
+          <p>Built and designed by Aviral Abel Willy.</p>
+          <p>&copy; {new Date().getFullYear()} All rights reserved.</p>
+        </>
+      )}
+    </div>
+  )
+
   return (
     <>
       {/* Mobile top bar — the only chrome visible on a phone until the
@@ -138,6 +161,8 @@ export default function Sidebar({ tabs, activeTab, setActiveTab, userEmail, user
 
               <NavItems compact={false} onNavigate={() => setDrawerOpen(false)} />
 
+              <Credit compact={false} />
+
               <div className="p-4 border-t border-gray-200 dark:border-gray-800 flex items-center gap-2">
                 <Avatar />
                 <p className="text-xs text-slate-400 truncate flex-1">{userEmail}</p>
@@ -176,6 +201,8 @@ export default function Sidebar({ tabs, activeTab, setActiveTab, userEmail, user
         </div>
 
         <NavItems compact={collapsed} />
+
+        <Credit compact={collapsed} />
 
         <div className={`p-4 border-t border-gray-200 dark:border-gray-800 flex ${collapsed ? 'flex-col items-center gap-2' : 'items-center gap-2'}`}>
           <Avatar />

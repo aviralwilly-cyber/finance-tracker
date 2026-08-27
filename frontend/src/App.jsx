@@ -6,6 +6,7 @@ import Login from './Login'
 import Onboarding from './Onboarding'
 import Dashboard from './Dashboard'
 
+
 export default function App() {
   const [user, setUser] = useState(null)
   const [checkingAuth, setCheckingAuth] = useState(true)
