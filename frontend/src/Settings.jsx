@@ -25,7 +25,6 @@ const PRESET_AVATARS = [
   '/avatars/10.jpg',
 ]
 
-
 function SettingsCard({ title, description, children }) {
   return (
     <div className="bg-white/85 dark:bg-gray-900/80 backdrop-blur-md rounded-2xl border border-gray-200 dark:border-gray-800 shadow-sm p-5">
@@ -367,7 +366,7 @@ export default function Settings({ user, profile, setProfile, showToast, categor
           </div>
         </div>
 
-           {/* added - aw */}
+        {/* added-aw */}
         <div className="mb-5">
   <p className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-2">Pick a preset avatar</p>
   <div className="flex gap-2 overflow-x-auto pb-2 -mx-1 px-1">
@@ -385,6 +384,7 @@ export default function Settings({ user, profile, setProfile, showToast, categor
     ))}
   </div>
 </div>
+
 
 
 
@@ -599,6 +599,20 @@ export default function Settings({ user, profile, setProfile, showToast, categor
             </select>
           </div>
           <button onClick={savePreferences} className={`${btnPrimary} self-start`}>Save preferences</button>
+
+          <div className="pt-4 border-t border-gray-100 dark:border-gray-800">
+            <p className="text-sm text-navy dark:text-gray-200 mb-1">Walkthrough</p>
+            <p className="text-xs text-slate-400 mb-2">Replay the tour of what each section does.</p>
+            <button
+              onClick={() => {
+                setProfile(p => ({ ...p, hasSeenTour: false }))
+                showToast('Here it is')
+              }}
+              className="px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-700 text-sm text-navy dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-800 transition"
+            >
+              Show walkthrough again
+            </button>
+          </div>
         </div>
       </SettingsCard>
 

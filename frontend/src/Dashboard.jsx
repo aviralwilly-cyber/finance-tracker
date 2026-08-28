@@ -17,6 +17,7 @@ import Settings from './Settings'
 import HealthScore from './HealthScore'
 import Admin from './Admin'
 import DeepAnalysis from './DeepAnalysis'
+import Walkthrough from './Walkthrough'
 
 const COLORS = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#06b6d4', '#a855f7', '#ec4899', '#84cc16', '#f97316', '#14b8a6', '#64748b']
 const SAVINGS_COLORS = ['#4ade80', '#60a5fa', '#facc15', '#a78bfa']
@@ -194,6 +195,8 @@ export default function Dashboard({ user, profile, setProfile }) {
   const [householdInvites, setHouseholdInvites] = useState([]) // pending invites addressed to me
   const [sentInvites, setSentInvites] = useState([]) // pending invites I've sent
   const [householdSpending, setHouseholdSpending] = useState(null)
+  const [householdBills, setHouseholdBills] = useState([])
+  const [householdMessages, setHouseholdMessages] = useState([])
 
   const loadHousehold = async () => {
     const [houseRes, invitesRes] = await Promise.all([
@@ -207,15 +210,146 @@ export default function Dashboard({ user, profile, setProfile }) {
     setSentInvites(invites.sent || [])
 
     if (houseData.household) {
-      const spendRes = await authedFetch('/household/spending')
+      const [spendRes, billsRes, msgRes] = await Promise.all([
+        authedFetch('/household/spending'),
+        authedFetch('/household/bills'),
+        authedFetch('/household/messages')
+      ])
       setHouseholdSpending(await spendRes.json())
+      setHouseholdBills(billsRes.ok ? await billsRes.json() : [])
+      setHouseholdMessages(msgRes.ok ? await msgRes.json() : [])
     } else {
       setHouseholdSpending(null)
+      setHouseholdBills([])
+      setHouseholdMessages([])
     }
   }
 
+  // --- Unseen household activity ---
+  //
+  // No push infrastructure here, so this is deliberately simple: remember
+  // when you last opened the Household tab, and compare that against the
+  // newest message/bill timestamp. Stored per-user in localStorage, so it
+  // doesn't leak between accounts on a shared browser.
+  //
+  // Honest limitation: it only updates when household data is fetched
+  // (page load, or acting on the tab) — it won't light up in real time
+  // while you sit on another tab.
+  const lastSeenKey = `householdLastSeen:${user.uid}`
+  const [householdLastSeen, setHouseholdLastSeen] = useState(
+    () => localStorage.getItem(lastSeenKey) || ''
+  )
+
+  const newestHouseholdActivity = (() => {
+    const stamps = [
+      ...householdMessages.map(m => m.at),
+      ...householdBills.map(b => b.createdAt)
+    ].filter(Boolean)
+    return stamps.length > 0 ? stamps.sort().pop() : null
+  })()
+
+  const hasUnseenHousehold = !!household
+    && !!newestHouseholdActivity
+    && newestHouseholdActivity > householdLastSeen
+
+  // Opening the tab marks everything currently loaded as seen.
+  useEffect(() => {
+    if (activeTab === 'household' && newestHouseholdActivity) {
+      localStorage.setItem(lastSeenKey, newestHouseholdActivity)
+      setHouseholdLastSeen(newestHouseholdActivity)
+    }
+  }, [activeTab, newestHouseholdActivity, lastSeenKey])
+
+  // First-run walkthrough. Driven by the profile flag so it shows once per
+  // ACCOUNT rather than once per browser.
+  const [showTour, setShowTour] = useState(false)
+  useEffect(() => {
+    if (profile && profile.hasSeenTour === false) setShowTour(true)
+  }, [profile])
+
   const [inviteEmail, setInviteEmail] = useState('')
   const [sendingInvite, setSendingInvite] = useState(false)
+
+  // --- Shared bills ---
+  const [billForm, setBillForm] = useState({ name: '', amount: '', dueDate: '' })
+  const [savingBill, setSavingBill] = useState(false)
+
+  const addHouseholdBill = async (e) => {
+    e.preventDefault()
+    if (!billForm.name.trim() || !billForm.amount || !billForm.dueDate) return
+    setSavingBill(true)
+    const res = await authedFetch('/household/bills', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(billForm)
+    })
+    setSavingBill(false)
+    if (!res.ok) {
+      showToast("Couldn't add that bill", 'error')
+      return
+    }
+    const created = await res.json()
+    setHouseholdBills(prev => [...prev, created].sort((a, b) => (a.dueDate > b.dueDate ? 1 : -1)))
+    setBillForm({ name: '', amount: '', dueDate: '' })
+    showToast('Bill added')
+  }
+
+  const toggleBillPaid = async (bill) => {
+    const previous = householdBills
+    setHouseholdBills(prev => prev.map(b => (b.id === bill.id ? { ...b, paid: !b.paid } : b)))
+
+    const res = await authedFetch(`/household/bills/${bill.id}/paid`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paid: !bill.paid })
+    })
+    if (!res.ok) {
+      setHouseholdBills(previous)
+      showToast("Couldn't update that bill", 'error')
+    }
+  }
+
+  const deleteHouseholdBill = (bill) => {
+    setConfirmState({
+      message: `Remove "${bill.name}" from the shared bills?`,
+      confirmLabel: 'Remove bill',
+      onConfirm: async () => {
+        setConfirmState(null)
+        const previous = householdBills
+        setHouseholdBills(prev => prev.filter(b => b.id !== bill.id))
+        const res = await authedFetch(`/household/bills/${bill.id}`, { method: 'DELETE' })
+        if (!res.ok) {
+          setHouseholdBills(previous)
+          showToast("Couldn't remove that bill", 'error')
+        }
+      }
+    })
+  }
+
+  // --- Household chat ---
+  const [messageText, setMessageText] = useState('')
+  const [sendingMessage, setSendingMessage] = useState(false)
+
+  const sendHouseholdMessage = async (e) => {
+    e.preventDefault()
+    if (!messageText.trim()) return
+    setSendingMessage(true)
+    const res = await authedFetch('/household/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: messageText.trim() })
+    })
+    setSendingMessage(false)
+    if (!res.ok) {
+      showToast("Couldn't send that message", 'error')
+      return
+    }
+    // Resolve the response BEFORE the state updater — the `prev => ...`
+    // callback isn't async, so `await` isn't valid inside it.
+    const created = await res.json()
+    setHouseholdMessages(prev => [...prev, created])
+    setMessageText('')
+  }
 
   const sendHouseholdInvite = async (e) => {
     e.preventDefault()
@@ -789,6 +923,7 @@ export default function Dashboard({ user, profile, setProfile }) {
         userName={profile?.displayName}
         photoURL={profile?.photoURL}
         avatarEmoji={profile?.avatarEmoji}
+        badges={{ household: hasUnseenHousehold }}
         onLogout={() => signOut(auth)}
       />
 
@@ -1573,7 +1708,7 @@ export default function Dashboard({ user, profile, setProfile }) {
             {activeTab === 'household' && (
               <div className="flex flex-col gap-6">
                 {!household ? (
-                  <Card title="Household" description="Share a read-only spending view with one other person — budgets, income, and everything else stay private to each of you.">
+                  <Card title="Household" description="Share a spending view, bills, and a chat thread with up to 10 people — budgets, income, and transaction details stay private to each of you.">
                     <form onSubmit={sendHouseholdInvite} className="flex gap-2 max-w-md mb-2">
                       <input
                         type="email"
@@ -1652,6 +1787,48 @@ export default function Dashboard({ user, profile, setProfile }) {
                           </span>
                         ))}
                       </div>
+
+                      <div className="mt-4 pt-4 border-t border-gray-100 dark:border-gray-800">
+                        <p className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-2">
+                          Add someone else ({household.members.length}/10)
+                        </p>
+                        {household.members.length >= 10 ? (
+                          <p className="text-sm text-slate-400">This household is full.</p>
+                        ) : (
+                          <>
+                            <form onSubmit={sendHouseholdInvite} className="flex gap-2 max-w-md">
+                              <input
+                                type="email"
+                                value={inviteEmail}
+                                onChange={e => setInviteEmail(e.target.value)}
+                                placeholder="Their account email"
+                                className="flex-1 rounded-lg border border-gray-300 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-mint focus:border-mint"
+                              />
+                              <button type="submit" disabled={sendingInvite} className="btn-primary">
+                                {sendingInvite ? 'Sending…' : 'Invite'}
+                              </button>
+                            </form>
+
+                            {sentInvites.length > 0 && (
+                              <div className="flex flex-col gap-1.5 mt-3">
+                                {sentInvites.map(inv => (
+                                  <div key={inv.id} className="flex items-center justify-between text-sm">
+                                    <span className="text-slate-500 dark:text-slate-400">
+                                      Invite pending — {inv.toEmail}
+                                    </span>
+                                    <button
+                                      onClick={() => cancelSentInvite(inv.id)}
+                                      className="text-xs text-slate-400 hover:text-red-500 transition"
+                                    >
+                                      Cancel
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
                     </Card>
 
                     {householdSpending && (
@@ -1669,24 +1846,144 @@ export default function Dashboard({ user, profile, setProfile }) {
                         </ResponsiveContainer>
 
                         <div className="mt-4 pt-4 border-t border-gray-100 dark:border-gray-800">
-                          <p className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-2">Settle up (50/50 split)</p>
-                          <div className="flex flex-col gap-2">
-                            {householdSpending.settleUp.map(m => (
-                              <div key={m.uid} className="flex justify-between text-sm">
-                                <span className="text-navy dark:text-gray-200">{m.displayName}</span>
-                                <span className={`font-mono ${m.balance > 0.5 ? 'text-emerald-600 dark:text-mint' : m.balance < -0.5 ? 'text-red-500' : 'text-slate-400'}`}>
-                                  {m.balance > 0.5
-                                    ? `is owed $${m.balance.toFixed(2)}`
-                                    : m.balance < -0.5
-                                      ? `owes $${Math.abs(m.balance).toFixed(2)}`
-                                      : 'settled up'}
-                                </span>
-                              </div>
-                            ))}
-                          </div>
+                          <p className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-2">Recent activity</p>
+                          {(householdSpending.recentTransactions || []).length === 0 ? (
+                            <p className="text-sm text-slate-400">No spending logged yet this month.</p>
+                          ) : (
+                            <div className="flex flex-col gap-1.5">
+                              {householdSpending.recentTransactions.slice(0, 8).map((t, i) => (
+                                <div key={i} className="flex items-center justify-between text-sm gap-3">
+                                  <span className="text-slate-500 dark:text-slate-400 font-mono text-xs shrink-0">{t.date}</span>
+                                  <span className="text-navy dark:text-gray-200 truncate flex-1">{t.category}</span>
+                                  <span className="text-xs text-slate-400 shrink-0 hidden sm:inline">{t.memberName}</span>
+                                  <span className="font-mono text-navy dark:text-gray-200 shrink-0">${Number(t.amount).toFixed(2)}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       </Card>
                     )}
+
+                    <Card title="Shared bills" description="Upcoming household costs — rent, hydro, internet. Visible to everyone in the household.">
+                      <form onSubmit={addHouseholdBill} className="flex flex-wrap gap-2 mb-4">
+                        <input
+                          value={billForm.name}
+                          onChange={e => setBillForm(f => ({ ...f, name: e.target.value }))}
+                          placeholder="e.g. Hydro"
+                          className="flex-1 min-w-[140px] rounded-lg border border-gray-300 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-mint focus:border-mint"
+                        />
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={billForm.amount}
+                          onChange={e => setBillForm(f => ({ ...f, amount: e.target.value }))}
+                          placeholder="Amount"
+                          className="w-28 rounded-lg border border-gray-300 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-mint focus:border-mint"
+                        />
+                        <input
+                          type="date"
+                          value={billForm.dueDate}
+                          onChange={e => setBillForm(f => ({ ...f, dueDate: e.target.value }))}
+                          className="rounded-lg border border-gray-300 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-mint focus:border-mint"
+                        />
+                        <button type="submit" disabled={savingBill} className="btn-primary">
+                          {savingBill ? 'Adding…' : 'Add bill'}
+                        </button>
+                      </form>
+
+                      {householdBills.length === 0 ? (
+                        <p className="text-sm text-slate-400">No shared bills yet.</p>
+                      ) : (
+                        <div className="flex flex-col gap-2">
+                          {householdBills.map(bill => {
+                            const overdue = !bill.paid && bill.dueDate < new Date().toISOString().slice(0, 10)
+                            const perPerson = (bill.splitBetween?.length || 1) > 1
+                              ? bill.amount / bill.splitBetween.length
+                              : null
+                            return (
+                              <div
+                                key={bill.id}
+                                className={`flex items-center gap-3 rounded-lg border px-3 py-2.5 ${
+                                  bill.paid
+                                    ? 'border-gray-200 dark:border-gray-800 opacity-60'
+                                    : overdue
+                                      ? 'border-red-300 dark:border-red-900/50 bg-red-50/50 dark:bg-red-900/10'
+                                      : 'border-gray-200 dark:border-gray-700'
+                                }`}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={!!bill.paid}
+                                  onChange={() => toggleBillPaid(bill)}
+                                  className="w-4 h-4 accent-mint shrink-0"
+                                />
+                                <div className="min-w-0 flex-1">
+                                  <p className={`text-sm text-navy dark:text-gray-200 ${bill.paid ? 'line-through' : ''}`}>
+                                    {bill.name}
+                                  </p>
+                                  <p className="text-xs text-slate-400">
+                                    Due {bill.dueDate}
+                                    {overdue && <span className="text-red-500 ml-1.5">overdue</span>}
+                                    {perPerson && <span className="ml-1.5">· ${perPerson.toFixed(2)} each</span>}
+                                  </p>
+                                </div>
+                                <span className="font-mono text-sm text-navy dark:text-gray-200 shrink-0">
+                                  ${Number(bill.amount).toFixed(2)}
+                                </span>
+                                <button
+                                  onClick={() => deleteHouseholdBill(bill)}
+                                  className="text-slate-400 hover:text-red-500 transition shrink-0 text-sm"
+                                >
+                                  ✕
+                                </button>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </Card>
+
+                    <Card title="Household chat" description="A shared thread for whoever's in the household.">
+                      <div className="max-h-72 overflow-y-auto flex flex-col gap-2 mb-3">
+                        {householdMessages.length === 0 ? (
+                          <p className="text-sm text-slate-400">No messages yet — say something.</p>
+                        ) : (
+                          householdMessages.map(m => {
+                            const mine = m.fromUid === user.uid
+                            return (
+                              <div key={m.id} className={`flex ${mine ? 'justify-end' : 'justify-start'}`}>
+                                <div className={`max-w-[80%] rounded-2xl px-3 py-2 ${
+                                  mine
+                                    ? 'bg-mint text-navy'
+                                    : 'bg-gray-100 dark:bg-gray-800 text-navy dark:text-gray-200'
+                                }`}>
+                                  {!mine && <p className="text-[11px] font-medium opacity-70 mb-0.5">{m.fromName}</p>}
+                                  <p className="text-sm whitespace-pre-wrap break-words">{m.text}</p>
+                                  <p className="text-[10px] opacity-60 mt-0.5">
+                                    {new Date(m.at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                                  </p>
+                                </div>
+                              </div>
+                            )
+                          })
+                        )}
+                      </div>
+                      <form onSubmit={sendHouseholdMessage} className="flex gap-2">
+                        <input
+                          value={messageText}
+                          onChange={e => setMessageText(e.target.value)}
+                          placeholder="Message the household…"
+                          className="flex-1 rounded-lg border border-gray-300 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-mint focus:border-mint"
+                        />
+                        <button type="submit" disabled={sendingMessage || !messageText.trim()} className="btn-primary disabled:opacity-40">
+                          Send
+                        </button>
+                      </form>
+                      <p className="text-xs text-slate-400 mt-2">
+                        Messages refresh when you reload — this isn't live chat.
+                      </p>
+                    </Card>
                   </>
                 )}
               </div>
@@ -1800,6 +2097,12 @@ export default function Dashboard({ user, profile, setProfile }) {
             showToast(`Imported ${count} item${count === 1 ? '' : 's'} from receipt`)
           }}
         />
+      )}
+      {showTour && (
+        <Walkthrough onDone={() => {
+          setShowTour(false)
+          setProfile(p => ({ ...p, hasSeenTour: true }))
+        }} />
       )}
       <ToastContainer toasts={toasts} />
     </div>

@@ -140,7 +140,7 @@ export default function Onboarding({ onComplete }) {
   }
 
   return (
-    <div className="min-h-screen bg-gray-950 flex items-center justify-center px-6 py-12">
+    <div className="min-h-screen bg-gray-950 flex flex-col items-center justify-center px-6 py-12">
       <motion.div
         initial={{ opacity: 0, y: 12 }}
         animate={{ opacity: 1, y: 0 }}
@@ -308,7 +308,13 @@ export default function Onboarding({ onComplete }) {
             </button>
           </div>
         </form>
+
       </motion.div>
+
+      <p className="text-sm text-slate-500 text-center mt-5 leading-relaxed">
+        Built and designed by Aviral Abel Willy.<br />
+        © 2026 All rights reserved.
+      </p>
     </div>
   )
 }

@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react'
 import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
-  sendPasswordResetEmail
+  sendPasswordResetEmail,
+  sendEmailVerification
 } from 'firebase/auth'
 import { auth } from './firebase'
 import { API } from './api'
@@ -45,7 +46,10 @@ export default function Login() {
       if (mode === 'login') {
         await signInWithEmailAndPassword(auth, email, password)
       } else if (mode === 'signup') {
-        await createUserWithEmailAndPassword(auth, email, password)
+        const credential = await createUserWithEmailAndPassword(auth, email, password)
+        // Send immediately on signup so the verification gate isn't the
+        // first place they hear about it.
+        await sendEmailVerification(credential.user).catch(() => {})
       } else {
         await sendPasswordResetEmail(auth, email)
         // Deliberately worded so it doesn't confirm whether an account
@@ -198,23 +202,12 @@ export default function Login() {
           </p>
         </div>
 
-        {/* Attribution — stacked below the card rather than pinned to the
-            viewport bottom, so it can't collide with the card on short
-            screens or when the form changes height between modes. */}
-        <p
-          style={{
-            marginTop: '1.5rem',
-            marginBottom: 0,
-            fontSize: 12,
-            lineHeight: 1.6,
-            textAlign: 'center',
-            fontFamily: 'system-ui, sans-serif',
-            color: theme.subtext
-          }}
-        >
-          Built and designed by Aviral Abel Willy.
-          <br />
-          &copy; {new Date().getFullYear()} All rights reserved.
+        <p style={{
+          fontSize: 13, color: theme.subtext, textAlign: 'center',
+          marginTop: 20, marginBottom: 0, lineHeight: 1.7
+        }}>
+          Built and designed by Aviral Abel Willy.<br />
+          © 2026 All rights reserved.
         </p>
       </div>
     </div>

@@ -5,7 +5,7 @@ import { authedFetch } from './api'
 import Login from './Login'
 import Onboarding from './Onboarding'
 import Dashboard from './Dashboard'
-
+import VerifyEmail from './VerifyEmail'
 
 export default function App() {
   const [user, setUser] = useState(null)
@@ -22,7 +22,7 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    if (!user) {
+    if (!user || !user.emailVerified) {
       setProfile(null)
       return
     }
@@ -38,6 +38,8 @@ export default function App() {
   }
 
   if (!user) return <Login />
+  // Hard gate: nothing past this point until the address is confirmed.
+  if (!user.emailVerified) return <VerifyEmail user={user} />
   if (!profile?.displayName) return <Onboarding onComplete={setProfile} />
   return <Dashboard key={user.uid} user={user} profile={profile} setProfile={setProfile} />
 }
