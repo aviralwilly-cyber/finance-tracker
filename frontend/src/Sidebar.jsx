@@ -10,7 +10,7 @@ import MoneyBagIcon from './MoneyBagIcon'
 // a 390px phone leaves ~160px of usable width, which no amount of
 // responsive tweaking makes workable — the sidebar has to get out of the
 // way entirely.
-export default function Sidebar({ tabs, activeTab, setActiveTab, userEmail, userName, photoURL, avatarEmoji, onLogout }) {
+export default function Sidebar({ tabs, activeTab, setActiveTab, userEmail, userName, photoURL, avatarEmoji, badges = {}, onLogout }) {
   const [collapsed, setCollapsed] = useState(() => {
     if (typeof window === 'undefined') return false
     return localStorage.getItem('sidebarCollapsed') === 'true'
@@ -77,35 +77,15 @@ export default function Sidebar({ tabs, activeTab, setActiveTab, userEmail, user
           {tab.icon && (
             <span className="relative">
               <tab.icon className="w-4 h-4" />
+              {badges[tab.id] && (
+                <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-mint ring-2 ring-white dark:ring-gray-900" />
+              )}
             </span>
           )}
           {!compact && <span className="relative ml-2 whitespace-nowrap">{tab.label}</span>}
         </button>
       ))}
     </nav>
-  )
-
-  // Attribution + copyright notice. Sits below the nav (which is flex-1, so
-  // it gets pushed to the bottom of the rail) and above the account block.
-  // At w-16 two lines of text would wrap into a mess, so the collapsed state
-  // degrades to a bare © with the full notice as a tooltip.
-  const Credit = ({ compact }) => (
-    <div
-      className={`px-4 py-3 border-t border-gray-200 dark:border-gray-800 text-center text-slate-400 dark:text-slate-500 ${
-        compact ? 'text-[10px]' : 'text-[11px] leading-relaxed'
-      }`}
-    >
-      {compact ? (
-        <p title={`Built and designed by Aviral Abel Willy. © ${new Date().getFullYear()} All rights reserved.`}>
-          &copy;
-        </p>
-      ) : (
-        <>
-          <p>Built and designed by Aviral Abel Willy.</p>
-          <p>&copy; {new Date().getFullYear()} All rights reserved.</p>
-        </>
-      )}
-    </div>
   )
 
   return (
@@ -161,8 +141,12 @@ export default function Sidebar({ tabs, activeTab, setActiveTab, userEmail, user
 
               <NavItems compact={false} onNavigate={() => setDrawerOpen(false)} />
 
-              <Credit compact={false} />
-
+              <div className="px-4 py-3 border-t border-gray-200 dark:border-gray-800 text-center">
+                <p className="text-[11px] text-slate-400 dark:text-slate-500 leading-relaxed">
+                  Built and designed by Aviral Abel Willy.<br />
+                  © 2026 All rights reserved.
+                </p>
+              </div>
               <div className="p-4 border-t border-gray-200 dark:border-gray-800 flex items-center gap-2">
                 <Avatar />
                 <p className="text-xs text-slate-400 truncate flex-1">{userEmail}</p>
@@ -202,8 +186,14 @@ export default function Sidebar({ tabs, activeTab, setActiveTab, userEmail, user
 
         <NavItems compact={collapsed} />
 
-        <Credit compact={collapsed} />
-
+        {!collapsed && (
+          <div className="px-4 py-3 border-t border-gray-200 dark:border-gray-800 text-center">
+            <p className="text-[11px] text-slate-400 dark:text-slate-500 leading-relaxed">
+              Built and designed by Aviral Abel Willy.<br />
+              © 2026 All rights reserved.
+            </p>
+          </div>
+        )}
         <div className={`p-4 border-t border-gray-200 dark:border-gray-800 flex ${collapsed ? 'flex-col items-center gap-2' : 'items-center gap-2'}`}>
           <Avatar />
           {!collapsed && <p className="text-xs text-slate-400 truncate flex-1">{userEmail}</p>}

@@ -53,6 +53,11 @@ const VISION_MODEL = 'qwen/qwen3.6-27b'; // free-tier eligible, text + image inp
 
 const SAVINGS_TYPES = ['Savings', 'Investment', 'Retirement', 'Other'];
 
+// Households are for genuine shared living/spending, not open groups. The
+// spending view fetches every member's transactions on each load, so this
+// cap is also what keeps that query from growing unbounded.
+const MAX_HOUSEHOLD_MEMBERS = 10;
+
 // --- Auth middleware: verifies the Firebase ID token sent from the frontend
 // and scopes every request to that user's own data. ---
 async function requireAuth(req, res, next) {
@@ -69,6 +74,17 @@ async function requireAuth(req, res, next) {
 
   try {
     const decoded = await auth.verifyIdToken(token);
+
+    // The frontend gate is UX; this is the actual enforcement. A valid
+    // token from an unverified account could otherwise call the API
+    // directly and skip the gate entirely.
+    if (!decoded.email_verified) {
+      return res.status(403).json({
+        error: 'Email not verified. Check your inbox for the verification link.',
+        code: 'email_not_verified'
+      });
+    }
+
     req.uid = decoded.uid;
     req.userDocRef = db.collection('users').doc(req.uid);
     // Each user's data lives in their own subcollections: users/{uid}/...
@@ -298,7 +314,8 @@ app.get('/api/profile', requireAuth, async (req, res) => {
     jobTitle: req.profile.jobTitle || '',
     financialGoal: req.profile.financialGoal || null,
     householdId: req.profile.householdId || null,
-    role: req.profile.role || 'user'
+    role: req.profile.role || 'user',
+    hasSeenTour: req.profile.hasSeenTour === true
   });
 });
 
@@ -376,6 +393,14 @@ app.delete('/api/profile/gallery/:index', requireAuth, async (req, res) => {
 
   await req.userDocRef.set(update, { merge: true });
   res.status(200).json(update);
+});
+
+// Marks the first-run walkthrough as seen. Its own route because the
+// profile POST requires displayName + purpose, and dismissing a tour
+// shouldn't mean resending unrelated fields just to pass validation.
+app.post('/api/profile/tour-seen', requireAuth, async (req, res) => {
+  await req.userDocRef.set({ hasSeenTour: true }, { merge: true });
+  res.status(200).json({ hasSeenTour: true });
 });
 
 // --- Data export & account deletion ---
@@ -1299,8 +1324,15 @@ app.post('/api/household/invite', requireAuth, async (req, res) => {
   if (!email || !email.trim()) {
     return res.status(400).json({ error: 'email is required' });
   }
+
+  // Members of an existing household CAN invite more people — that's how a
+  // household grows past two. Only the size cap applies.
   if (req.profile.householdId) {
-    return res.status(400).json({ error: "You're already in a household — leave it first to invite someone new." });
+    const householdSnap = await db.collection('households').doc(req.profile.householdId).get();
+    const memberCount = householdSnap.exists ? (householdSnap.data().members || []).length : 0;
+    if (memberCount >= MAX_HOUSEHOLD_MEMBERS) {
+      return res.status(400).json({ error: `Your household is full (${MAX_HOUSEHOLD_MEMBERS} members max).` });
+    }
   }
 
   let targetUser;
@@ -1528,7 +1560,16 @@ app.get('/api/household/spending', requireAuth, async (req, res) => {
 
   const combinedTotal = memberSpending.reduce((sum, m) => sum + m.total, 0);
 
-  res.json({ memberSpending, combinedTotal });
+  // A single merged timeline across everyone, newest first. Deliberately
+  // carries category rather than description: the household view is meant
+  // to show "£40 on Groceries yesterday", not which shop someone went to.
+  // Sharing a spending total shouldn't mean surrendering a merchant log.
+  const recentTransactions = memberSpending
+    .flatMap(m => m.recent.map(t => ({ ...t, memberName: m.displayName })))
+    .sort((a, b) => (a.date < b.date ? 1 : -1))
+    .slice(0, 10);
+
+  res.json({ memberSpending, combinedTotal, recentTransactions });
 });
 
 // --- Shared household bills ---
@@ -1737,6 +1778,11 @@ app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
       purpose: profile.purpose || null,
       role: profile.role || 'user',
       disabled: authUser?.disabled ?? false,
+      // No Auth record means the sign-in account was deleted but this
+      // Firestore document survived. Nothing can sign in as them, and
+      // disable/reset would fail — so the UI needs to know rather than
+      // offering actions that silently error.
+      orphaned: !authUser,
       createdAt: authUser?.metadata?.creationTime || null,
       lastSignIn: authUser?.metadata?.lastSignInTime || null,
       transactionCount: txSnap.size,
@@ -1910,6 +1956,33 @@ app.get('/api/admin/users/export', requireAuth, requireAdmin, async (req, res) =
   res.setHeader('Content-Type', 'text/csv');
   res.setHeader('Content-Disposition', `attachment; filename="users-${new Date().toISOString().slice(0, 10)}.csv"`);
   res.send(csv);
+});
+
+// Deletes a Firestore user document whose Firebase Auth account no longer
+// exists. These are leftovers from an account deleted directly in the
+// Firebase console — nobody can sign in as them, but they linger in the
+// admin list and can't be disabled, because there's no Auth record to act on.
+//
+// Refuses if the Auth user DOES exist, so this can't be used as a way to
+// delete a live account without going through the normal path.
+app.delete('/api/admin/users/:uid/orphaned', requireAuth, requireAdmin, async (req, res) => {
+  const authUser = await auth.getUser(req.params.uid).catch(() => null);
+  if (authUser) {
+    return res.status(400).json({
+      error: 'That account still exists in Firebase Auth — disable it instead of purging it.'
+    });
+  }
+
+  await logAdminAccess(req.uid, req.params.uid, 'purge_orphaned_record');
+
+  const userRef = db.collection('users').doc(req.params.uid);
+  for (const name of ['transactions', 'income', 'savings', 'budgets', 'recurring', 'chat']) {
+    const snap = await userRef.collection(name).get();
+    await Promise.all(snap.docs.map(d => d.ref.delete()));
+  }
+  await userRef.delete();
+
+  res.status(204).end();
 });
 
 app.get('/api/admin/audit-log', requireAuth, requireAdmin, async (req, res) => {
