@@ -1,0 +1,30 @@
+.text-type {
+  display: inline-block;
+  white-space: pre-wrap;
+}
+
+.text-type__cursor {
+  margin-left: 0.25rem;
+  display: inline-block;
+  opacity: 1;
+  /* The original component drives this with GSAP. A keyframe animation does
+     the same job without pulling in an animation library for one element. */
+  animation: text-type-blink 1s ease-in-out infinite;
+}
+
+.text-type__cursor--hidden {
+  display: none;
+}
+
+@keyframes text-type-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* Respect users who've asked for reduced motion — a blinking cursor is
+   exactly the kind of thing that setting exists for. */
+@media (prefers-reduced-motion: reduce) {
+  .text-type__cursor {
+    animation: none;
+  }
+}

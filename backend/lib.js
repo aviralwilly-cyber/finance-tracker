@@ -217,3 +217,195 @@ export function chunkStatementText(text) {
   const truncated = pages.length > MAX_STATEMENT_CHUNKS;
   return { chunks: pages.slice(0, MAX_STATEMENT_CHUNKS), truncated };
 }
+
+// --- Recurring bill detection ---
+//
+// Finds subscriptions and bills already hiding in transaction history, so
+// someone doesn't have to remember and manually declare every one.
+//
+// Deliberately deterministic — no AI. The signal here is structural
+// (same merchant, similar amount, evenly spaced dates), which is exactly
+// the kind of pattern code is better at than a language model, and it means
+// the result is explainable: every suggestion can say WHY it was flagged.
+
+// Merchant descriptions are noisy — "NETFLIX.COM 8668396" and
+// "NETFLIX.COM 8661234" are the same subscription with a different
+// reference number. Strip the parts that vary between charges.
+export function normalizeMerchant(description) {
+  return (description || '')
+    .toLowerCase()
+    .replace(/\d{4,}/g, ' ')                    // long digit runs: refs, card fragments
+    .replace(/#\s*\w+/g, ' ')                   // store numbers: "#2917"
+    .replace(/\b\d{1,2}\/\d{1,2}(\/\d{2,4})?\b/g, ' ') // embedded dates
+    .replace(/[^a-z\s]/g, ' ')                  // punctuation
+    .replace(/\b(inc|llc|ltd|com|ca|corp|co)\b/g, ' ') // corporate suffixes
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function daysBetween(a, b) {
+  return Math.round((new Date(b + 'T00:00:00') - new Date(a + 'T00:00:00')) / 86400000);
+}
+
+function median(numbers) {
+  const sorted = [...numbers].sort((x, y) => x - y);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+// Maps an average gap in days onto one of the frequencies the recurring
+// system already supports. Tolerances are wide enough to absorb weekend
+// shifts and "3rd of the month" drift across months of differing lengths.
+function inferFrequency(avgGapDays) {
+  if (avgGapDays >= 6 && avgGapDays <= 8) return 'weekly';
+  if (avgGapDays >= 12 && avgGapDays <= 16) return 'biweekly';
+  if (avgGapDays >= 26 && avgGapDays <= 35) return 'monthly';
+  return null; // not a cadence we can represent — don't guess
+}
+
+export const MIN_OCCURRENCES = 3;          // two charges could be coincidence
+export const AMOUNT_TOLERANCE = 0.15;      // 15% — covers usage-based bills like hydro
+export const GAP_IRREGULARITY_LIMIT = 0.25; // spacing must be reasonably even
+
+// Returns suggested recurring rules, each with the evidence behind it.
+// `existingRecurring` suppresses anything the user already tracks.
+export function detectRecurringBills(transactions, existingRecurring = [], today = new Date().toISOString().slice(0, 10)) {
+  const alreadyTracked = new Set(
+    existingRecurring.map(r => normalizeMerchant(r.description)).filter(Boolean)
+  );
+
+  // Group by normalized merchant.
+  const groups = {};
+  for (const t of transactions) {
+    if (t.type === 'credit') continue; // income/refunds aren't bills
+    const key = normalizeMerchant(t.description);
+    if (!key || key.length < 3) continue;
+    (groups[key] = groups[key] || []).push(t);
+  }
+
+  const suggestions = [];
+
+  for (const [key, group] of Object.entries(groups)) {
+    if (group.length < MIN_OCCURRENCES) continue;
+    if (alreadyTracked.has(key)) continue;
+
+    const sorted = [...group].sort((a, b) => (a.date < b.date ? -1 : 1));
+
+    // Amounts must be consistent. Median rather than mean so one anomalous
+    // charge doesn't drag the baseline and mask a real pattern.
+    const amounts = sorted.map(t => t.amount);
+    const typicalAmount = median(amounts);
+    if (typicalAmount <= 0) continue;
+    const amountsConsistent = amounts.every(
+      a => Math.abs(a - typicalAmount) / typicalAmount <= AMOUNT_TOLERANCE
+    );
+    if (!amountsConsistent) continue;
+
+    // Dates must be evenly spaced. Three coffees in a random week share a
+    // merchant and a price but aren't a subscription — the spacing is what
+    // separates a bill from a habit.
+    const gaps = [];
+    for (let i = 1; i < sorted.length; i++) {
+      gaps.push(daysBetween(sorted[i - 1].date, sorted[i].date));
+    }
+    const avgGap = gaps.reduce((s, g) => s + g, 0) / gaps.length;
+    if (avgGap <= 0) continue;
+
+    const maxDeviation = Math.max(...gaps.map(g => Math.abs(g - avgGap)));
+    if (maxDeviation / avgGap > GAP_IRREGULARITY_LIMIT) continue;
+
+    const frequency = inferFrequency(avgGap);
+    if (!frequency) continue;
+
+    const lastDate = sorted[sorted.length - 1].date;
+    let nextDueDate = advanceDate(lastDate, frequency);
+    // If the projected date already passed, roll forward so the suggestion
+    // is actionable rather than retroactive.
+    while (nextDueDate < today) {
+      nextDueDate = advanceDate(nextDueDate, frequency);
+    }
+
+    suggestions.push({
+      // Longest description in the group reads best — the shortest is often
+      // truncated by the statement parser.
+      description: sorted.map(t => t.description).sort((a, b) => b.length - a.length)[0],
+      amount: Number(typicalAmount.toFixed(2)),
+      category: sorted[sorted.length - 1].category,
+      frequency,
+      nextDueDate,
+      // Evidence, so the UI can explain the suggestion rather than assert it.
+      occurrences: sorted.length,
+      averageGapDays: Math.round(avgGap),
+      firstSeen: sorted[0].date,
+      lastSeen: lastDate,
+      sampleDates: sorted.map(t => t.date),
+      totalSpent: Number(amounts.reduce((s, a) => s + a, 0).toFixed(2))
+    });
+  }
+
+  // Most money first — a $2,100 rent payment matters more than a $3 app.
+  return suggestions.sort((a, b) => b.amount - a.amount);
+}
+
+// --- Savings goals ---
+//
+// Envelope model: each goal holds its own allocated balance, so progress
+// is unambiguous. The alternative — measuring every goal against one shared
+// savings total — shows three goals worth $5,000 as partly funded when you
+// have $2,000, which reads as more progress than actually exists.
+//
+// All deterministic. The interesting number here is "what do I need to put
+// aside each month to make it", and that's arithmetic, not a judgement call.
+
+export function monthsBetween(fromDate, toDate) {
+  const from = new Date(fromDate + 'T00:00:00');
+  const to = new Date(toDate + 'T00:00:00');
+  const months = (to.getFullYear() - from.getFullYear()) * 12 + (to.getMonth() - from.getMonth());
+  // Partial month still counts as one — you can't save "0.4 months" of money.
+  return to.getDate() >= from.getDate() ? months : months - 1;
+}
+
+// Given a goal and how much is allocated to it, works out whether it's
+// reachable and what it takes. `recentMonthlySaving` is the user's actual
+// recent rate, used to say whether they're on track rather than just
+// stating a required number in isolation.
+export function goalProgress(goal, today = new Date().toISOString().slice(0, 10), recentMonthlySaving = null) {
+  const target = Number(goal.targetAmount) || 0;
+  const saved = Number(goal.allocated) || 0;
+  const remaining = Math.max(0, target - saved);
+  const percent = target > 0 ? Math.min(100, (saved / target) * 100) : 0;
+  const complete = target > 0 && saved >= target;
+
+  const result = {
+    target,
+    saved,
+    remaining: Number(remaining.toFixed(2)),
+    percent: Math.round(percent),
+    complete,
+    monthsLeft: null,
+    requiredPerMonth: null,
+    onTrack: null,
+    overdue: false
+  };
+
+  if (!goal.targetDate || complete) return result;
+
+  const monthsLeft = monthsBetween(today, goal.targetDate);
+  result.monthsLeft = monthsLeft;
+
+  if (monthsLeft < 0 || (monthsLeft === 0 && goal.targetDate < today)) {
+    result.overdue = true;
+    return result;
+  }
+
+  // Zero months left but the date hasn't passed means "this month" — the
+  // whole remainder is needed now, not divided by zero.
+  const effectiveMonths = Math.max(1, monthsLeft);
+  result.requiredPerMonth = Number((remaining / effectiveMonths).toFixed(2));
+
+  if (recentMonthlySaving !== null && recentMonthlySaving !== undefined) {
+    result.onTrack = recentMonthlySaving >= result.requiredPerMonth;
+  }
+
+  return result;
+}
