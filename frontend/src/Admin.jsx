@@ -42,6 +42,7 @@ const TABS = [
   { id: 'analytics', label: 'Analytics' },
   { id: 'observability', label: 'Observability' },
   { id: 'users', label: 'Users' },
+  { id: 'support', label: 'Support' },
   { id: 'settings', label: 'App settings' },
   { id: 'audit', label: 'Audit log' }
 ]
@@ -51,6 +52,7 @@ export default function Admin({ currentUid, showToast }) {
   const [analytics, setAnalytics] = useState(null)
   const [users, setUsers] = useState([])
   const [auditLog, setAuditLog] = useState([])
+  const [support, setSupport] = useState({ tickets: [], openCount: 0 })
   const [observability, setObservability] = useState(null)
   const [settings, setSettings] = useState(null)
   const [broadcastDraft, setBroadcastDraft] = useState('')
@@ -60,13 +62,15 @@ export default function Admin({ currentUid, showToast }) {
   const [viewingUser, setViewingUser] = useState(null) // { uid, email, transactions }
 
   const load = async () => {
-    const [aRes, uRes, lRes, oRes, sRes] = await Promise.all([
+    const [aRes, uRes, lRes, oRes, sRes, tRes] = await Promise.all([
       authedFetch('/admin/analytics'),
       authedFetch('/admin/users'),
       authedFetch('/admin/audit-log'),
       authedFetch('/admin/observability'),
-      authedFetch('/admin/settings')
+      authedFetch('/admin/settings'),
+      authedFetch('/admin/support')
     ])
+    if (tRes.ok) setSupport(await tRes.json())
     if (aRes.ok) setAnalytics(await aRes.json())
     if (uRes.ok) setUsers(await uRes.json())
     if (lRes.ok) setAuditLog(await lRes.json())
@@ -103,6 +107,44 @@ export default function Admin({ currentUid, showToast }) {
           return
         }
         showToast(turningOff ? 'Account disabled' : 'Account enabled')
+        load()
+      }
+    })
+  }
+
+  const setTicketStatus = async (ticket, status) => {
+    const previous = support
+    setSupport(prev => ({
+      ...prev,
+      tickets: prev.tickets.map(t => (t.id === ticket.id ? { ...t, status } : t)),
+      openCount: prev.openCount + (status === 'resolved' ? -1 : 1)
+    }))
+    const res = await authedFetch(`/admin/support/${ticket.id}/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status })
+    })
+    if (!res.ok) {
+      setSupport(previous)
+      showToast("Couldn't update that ticket", 'error')
+    }
+  }
+
+  const purgeOrphaned = (user) => {
+    setConfirmState({
+      title: 'Purge this leftover record?',
+      message: `${user.displayName || user.uid} has no Firebase Auth account — nobody can sign in as them. This permanently deletes their remaining Firestore data. It cannot be undone.`,
+      confirmLabel: 'Purge record',
+      variant: 'danger',
+      onConfirm: async () => {
+        setConfirmState(null)
+        const res = await authedFetch(`/admin/users/${user.uid}/orphaned`, { method: 'DELETE' })
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}))
+          showToast(data.error || "Couldn't purge that record", 'error')
+          return
+        }
+        showToast('Record purged')
         load()
       }
     })
@@ -230,6 +272,11 @@ export default function Admin({ currentUid, showToast }) {
             }`}
           >
             {t.label}
+            {t.id === 'support' && support.openCount > 0 && (
+              <span className="ml-1.5 text-[10px] bg-mint text-navy px-1.5 py-0.5 rounded-full font-mono">
+                {support.openCount}
+              </span>
+            )}
           </button>
         ))}
       </div>
@@ -317,6 +364,11 @@ export default function Admin({ currentUid, showToast }) {
                       {u.role === 'admin' && (
                         <span className="inline-block mt-0.5 text-[10px] bg-mint/20 text-mint px-1.5 py-0.5 rounded">admin</span>
                       )}
+                      {u.orphaned && (
+                        <span className="block text-[10px] text-amber-600 dark:text-amber-400 mt-0.5">
+                          sign-in account deleted
+                        </span>
+                      )}
                     </td>
                     <td className="py-2.5 capitalize text-slate-500 dark:text-slate-400">{u.purpose || '—'}</td>
                     <td className="py-2.5 font-mono text-xs text-slate-500 dark:text-slate-400">
@@ -326,30 +378,51 @@ export default function Admin({ currentUid, showToast }) {
                       {u.lastSignIn ? new Date(u.lastSignIn).toLocaleDateString() : '—'}
                     </td>
                     <td className="py-2.5">
-                      {u.disabled
-                        ? <span className="text-xs text-red-500">Disabled</span>
-                        : <span className="text-xs text-emerald-600 dark:text-emerald-400">Active</span>}
+                      {u.orphaned
+                        ? <span className="text-xs text-amber-600 dark:text-amber-400">No sign-in</span>
+                        : u.disabled
+                          ? <span className="text-xs text-red-500">Disabled</span>
+                          : <span className="text-xs text-emerald-600 dark:text-emerald-400">Active</span>}
                     </td>
                     <td className="py-2.5 text-right whitespace-nowrap">
-                      <button onClick={() => sendPasswordReset(u)} className="text-xs text-slate-400 hover:text-navy dark:hover:text-mint transition mr-3">
-                        Reset link
-                      </button>
-                      <button onClick={() => viewTransactions(u)} className="text-xs text-amber-600 dark:text-amber-400 hover:underline mr-3">
-                        View data
-                      </button>
-                      <button
-                        onClick={() => changeRole(u, u.role === 'admin' ? 'user' : 'admin')}
-                        className="text-xs text-slate-400 hover:text-navy dark:hover:text-mint transition mr-3"
-                      >
-                        {u.role === 'admin' ? 'Remove admin' : 'Make admin'}
-                      </button>
-                      {u.uid !== currentUid && (
-                        <button
-                          onClick={() => toggleDisabled(u)}
-                          className={`text-xs transition ${u.disabled ? 'text-emerald-600 hover:underline' : 'text-red-500 hover:underline'}`}
-                        >
-                          {u.disabled ? 'Enable' : 'Disable'}
-                        </button>
+                      {u.orphaned ? (
+                        // No Firebase Auth record, so reset/disable would
+                        // just error. Only viewing leftover data or purging
+                        // it makes sense here.
+                        <>
+                          <button onClick={() => viewTransactions(u)} className="text-xs text-amber-600 dark:text-amber-400 hover:underline mr-3">
+                            View data
+                          </button>
+                          <button
+                            onClick={() => purgeOrphaned(u)}
+                            className="text-xs text-red-500 hover:underline"
+                          >
+                            Purge record
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button onClick={() => sendPasswordReset(u)} className="text-xs text-slate-400 hover:text-navy dark:hover:text-mint transition mr-3">
+                            Reset link
+                          </button>
+                          <button onClick={() => viewTransactions(u)} className="text-xs text-amber-600 dark:text-amber-400 hover:underline mr-3">
+                            View data
+                          </button>
+                          <button
+                            onClick={() => changeRole(u, u.role === 'admin' ? 'user' : 'admin')}
+                            className="text-xs text-slate-400 hover:text-navy dark:hover:text-mint transition mr-3"
+                          >
+                            {u.role === 'admin' ? 'Remove admin' : 'Make admin'}
+                          </button>
+                          {u.uid !== currentUid && (
+                            <button
+                              onClick={() => toggleDisabled(u)}
+                              className={`text-xs transition ${u.disabled ? 'text-emerald-600 hover:underline' : 'text-red-500 hover:underline'}`}
+                            >
+                              {u.disabled ? 'Enable' : 'Disable'}
+                            </button>
+                          )}
+                        </>
                       )}
                     </td>
                   </tr>
@@ -598,6 +671,74 @@ export default function Admin({ currentUid, showToast }) {
             </button>
           </Card>
         </>
+      )}
+
+      {tab === 'support' && (
+        <Card
+          title="Support tickets"
+          description="Questions sent from the Help page. There's no email layer yet — replying means emailing them yourself."
+        >
+          {support.tickets.length === 0 ? (
+            <p className="text-sm text-slate-400">No tickets yet.</p>
+          ) : (
+            <div className="flex flex-col gap-3">
+              {support.tickets.map(t => (
+                <div
+                  key={t.id}
+                  className={`rounded-lg border p-4 ${
+                    t.status === 'resolved'
+                      ? 'border-gray-200 dark:border-gray-800 opacity-60'
+                      : 'border-gray-200 dark:border-gray-700'
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-3 mb-1">
+                    <p className="text-sm font-medium text-navy dark:text-gray-100">{t.subject}</p>
+                    <button
+                      onClick={() => setTicketStatus(t, t.status === 'resolved' ? 'open' : 'resolved')}
+                      className={`text-xs px-2.5 py-1 rounded-md border shrink-0 transition ${
+                        t.status === 'resolved'
+                          ? 'border-gray-300 dark:border-gray-700 text-slate-500 hover:bg-gray-50 dark:hover:bg-gray-800'
+                          : 'border-mint text-mint hover:bg-mint/10'
+                      }`}
+                    >
+                      {t.status === 'resolved' ? 'Reopen' : 'Mark resolved'}
+                    </button>
+                  </div>
+
+                  <p className="text-xs text-slate-400 mb-2">
+                    {t.fromName || 'Unknown'} · {t.fromEmail || 'no email'} ·{' '}
+                    {new Date(t.createdAt).toLocaleString()}
+                  </p>
+
+                  <p className="text-sm text-slate-600 dark:text-slate-300 whitespace-pre-wrap leading-relaxed">
+                    {t.message}
+                  </p>
+
+                  {t.context && (
+                    <div className="mt-3 pt-3 border-t border-gray-100 dark:border-gray-800">
+                      <p className="text-[11px] text-slate-400 font-mono leading-relaxed">
+                        {t.context.lastTab && <>tab: {t.context.lastTab} · </>}
+                        {t.context.viewport && <>viewport: {t.context.viewport}</>}
+                        {t.context.userAgent && (
+                          <><br />{t.context.userAgent}</>
+                        )}
+                      </p>
+                    </div>
+                  )}
+
+                  {t.fromEmail && t.status !== 'resolved' && (
+                    <a
+                      href={`mailto:${t.fromEmail}?subject=Re: ${encodeURIComponent(t.subject)}`}
+                      className="inline-block mt-3 text-xs text-mint hover:underline"
+                    >
+                      Reply by email →
+                    </a>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
       )}
 
       {tab === 'audit' && (

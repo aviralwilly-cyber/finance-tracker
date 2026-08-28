@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend, BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid } from 'recharts'
+import { Cell, Tooltip, ResponsiveContainer, Legend, BarChart, Bar, LabelList, LineChart, Line, XAxis, YAxis, CartesianGrid } from 'recharts'
 import { signOut } from 'firebase/auth'
-import { Mic, Upload, Camera, TrendingUp, Users, Shield, Megaphone, Sparkles, ChevronLeft, ChevronRight, LayoutDashboard, Receipt, PiggyBank, Wallet, MessageCircle, Settings as SettingsIcon } from 'lucide-react'
+import { Mic, Upload, Camera, TrendingUp, Users, Shield, Megaphone, Sparkles, LifeBuoy, ChevronLeft, ChevronRight, LayoutDashboard, Receipt, PiggyBank, Wallet, MessageCircle, Settings as SettingsIcon } from 'lucide-react'
 import { auth } from './firebase'
 import { authedFetch, API } from './api'
 import ConfirmDialog from './ConfirmDialog'
@@ -18,6 +18,9 @@ import HealthScore from './HealthScore'
 import Admin from './Admin'
 import DeepAnalysis from './DeepAnalysis'
 import Walkthrough from './Walkthrough'
+import Help from './Help'
+import TextType from './TextType'
+import SavingsGoals from './SavingsGoals'
 
 const COLORS = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#06b6d4', '#a855f7', '#ec4899', '#84cc16', '#f97316', '#14b8a6', '#64748b']
 const SAVINGS_COLORS = ['#4ade80', '#60a5fa', '#facc15', '#a78bfa']
@@ -28,7 +31,11 @@ const SAVINGS_COLORS = ['#4ade80', '#60a5fa', '#facc15', '#a78bfa']
 // you're doing — you want "remaining this month" visible while logging a
 // transaction or setting a budget. On Chat, Analyze, Settings, Predict and
 // Admin it's ~200px of stats you aren't thinking about, so it's hidden.
-const SHOW_INCOME_ON = ['overview', 'transactions', 'savings', 'budgets', 'household']
+// The income card lives on Overview only. It's ~200px of stats that are
+// only really the point of that one tab — everywhere else it pushed the
+// actual content down. The admin broadcast below is separate and DOES show
+// everywhere, since an announcement nobody sees is pointless.
+const SHOW_INCOME_ON = ['overview']
 
 const BASE_TABS = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard },
@@ -40,6 +47,7 @@ const BASE_TABS = [
   { id: 'chat', label: 'Chat', icon: MessageCircle },
   { id: 'analyze', label: 'Analyze', icon: Sparkles },
   { id: 'settings', label: 'Settings', icon: SettingsIcon },
+  { id: 'help', label: 'Help', icon: LifeBuoy },
   // Only rendered for users whose server-side profile role is 'admin'.
   // Hiding the tab is cosmetic — the actual protection is requireAdmin on
   // every /api/admin/* route, so a non-admin who forced this tab open
@@ -148,6 +156,7 @@ export default function Dashboard({ user, profile, setProfile }) {
 
   const [savings, setSavings] = useState([])
   const [savingsSummary, setSavingsSummary] = useState({})
+  const [savingsGoals, setSavingsGoals] = useState(null)
   const [savingsForm, setSavingsForm] = useState({ type: 'Savings', description: '', amount: '', date: '' })
   const [savingSavings, setSavingSavings] = useState(false)
 
@@ -259,6 +268,19 @@ export default function Dashboard({ user, profile, setProfile }) {
       setHouseholdLastSeen(newestHouseholdActivity)
     }
   }, [activeTab, newestHouseholdActivity, lastSeenKey])
+
+  // Remembers where the user was before opening Help, so a support ticket
+  // can say "they were on Transactions" rather than the useless "they were
+  // on Help".
+  const previousTabRef = useRef(null)
+  const [previousTab, setPreviousTab] = useState(null)
+  useEffect(() => {
+    if (activeTab !== 'help') {
+      previousTabRef.current = activeTab
+    } else {
+      setPreviousTab(previousTabRef.current)
+    }
+  }, [activeTab])
 
   // First-run walkthrough. Driven by the profile flag so it shows once per
   // ACCOUNT rather than once per browser.
@@ -411,13 +433,14 @@ export default function Dashboard({ user, profile, setProfile }) {
     // reflected in the transactions list this same load.
     await authedFetch('/recurring/process', { method: 'POST' })
 
-    const [txRes, sumRes, overviewRes, incomeRes, savingsRes, savingsSumRes, budgetsRes, trendRes, historyRes, categoriesRes, recurringRes, predictRes, healthRes] = await Promise.all([
+    const [txRes, sumRes, overviewRes, incomeRes, savingsRes, savingsSumRes, goalsRes, budgetsRes, trendRes, historyRes, categoriesRes, recurringRes, predictRes, healthRes] = await Promise.all([
       authedFetch('/transactions'),
       authedFetch('/transactions/summary'),
       authedFetch('/overview'),
       authedFetch('/income'),
       authedFetch('/savings'),
       authedFetch('/savings/summary'),
+      authedFetch('/savings/goals'),
       authedFetch('/budgets/progress'),
       authedFetch('/trend'),
       authedFetch('/chat/history'),
@@ -432,6 +455,7 @@ export default function Dashboard({ user, profile, setProfile }) {
     setIncomeHistory(await incomeRes.json())
     setSavings(await savingsRes.json())
     setSavingsSummary(await savingsSumRes.json())
+    setSavingsGoals(goalsRes.ok ? await goalsRes.json() : null)
     const budgetsData = await budgetsRes.json()
     setBudgetProgress(budgetsData.budgets || [])
     const newNudge = budgetsData.nudge || null
@@ -942,10 +966,18 @@ export default function Dashboard({ user, profile, setProfile }) {
             {broadcast && (
               <div className="flex items-start gap-2 bg-sky-50 dark:bg-sky-900/30 border border-sky-300 dark:border-sky-800 rounded-lg px-4 py-2.5 text-sm mb-4 text-sky-900 dark:text-sky-100">
                 <Megaphone className="w-4 h-4 shrink-0 mt-0.5" />
-                <span>{broadcast}</span>
+                <TextType
+                  as="span"
+                  text={broadcast}
+                  typingSpeed={35}
+                  initialDelay={300}
+                  loop={false}
+                  cursorCharacter="_"
+                  hideCursorWhileTyping={false}
+                />
               </div>
             )}
-            <p className="text-slate-500 dark:text-slate-400 text-sm mb-4">
+            <p className={`text-slate-500 dark:text-slate-400 text-sm ${SHOW_INCOME_ON.includes(activeTab) ? 'mb-4' : ''}`}>
               {profile?.displayName ? `Welcome back, ${profile.displayName}.` : 'Add a transaction and AI will categorize it automatically.'}
             </p>
 
@@ -1439,6 +1471,7 @@ export default function Dashboard({ user, profile, setProfile }) {
 
             {/* Savings tab */}
             {activeTab === 'savings' && (
+              <div className="flex flex-col gap-6">
               <Card title="Savings & Investments">
                 <form onSubmit={addSavings} className="flex flex-wrap gap-2 mb-4">
                   <select
@@ -1509,19 +1542,62 @@ export default function Dashboard({ user, profile, setProfile }) {
 
                   <div className="flex-1 min-w-[300px]">
                     {savingsChartData.length > 0 ? (
-                      <ResponsiveContainer width="100%" height={240}>
-                        <PieChart>
-                          <Pie data={savingsChartData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={90} label>
-                            {savingsChartData.map((_, i) => <Cell key={i} fill={SAVINGS_COLORS[i % SAVINGS_COLORS.length]} />)}
-                          </Pie>
+                      // Horizontal bars rather than a pie: with only four
+                      // savings types, a small category becomes an unreadable
+                      // sliver, and the labels collide. Bars stay legible
+                      // however lopsided the split is.
+                      <ResponsiveContainer width="100%" height={Math.max(160, savingsChartData.length * 52)}>
+                        <BarChart
+                          data={[...savingsChartData].sort((a, b) => b.value - a.value)}
+                          layout="vertical"
+                          margin={{ left: 8, right: 56 }}
+                        >
+                          <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="currentColor" className="text-gray-200 dark:text-gray-800" />
+                          <XAxis
+                            type="number"
+                            fontSize={11}
+                            stroke="currentColor"
+                            className="text-slate-500 dark:text-slate-400"
+                            tickFormatter={v => `$${v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v}`}
+                          />
+                          <YAxis
+                            dataKey="name"
+                            type="category"
+                            width={90}
+                            fontSize={12}
+                            stroke="currentColor"
+                            className="text-slate-500 dark:text-slate-400"
+                          />
                           <Tooltip formatter={(value) => `$${Number(value).toFixed(2)}`} />
-                          <Legend />
-                        </PieChart>
+                          <Bar dataKey="value" radius={[0, 4, 4, 0]} barSize={26}>
+                            {savingsChartData.map((_, i) => <Cell key={i} fill={SAVINGS_COLORS[i % SAVINGS_COLORS.length]} />)}
+                            <LabelList
+                              dataKey="value"
+                              position="right"
+                              formatter={v => `$${Number(v).toFixed(0)}`}
+                              className="fill-slate-500 dark:fill-slate-400"
+                              fontSize={11}
+                            />
+                          </Bar>
+                        </BarChart>
                       </ResponsiveContainer>
                     ) : <p className="text-slate-400 dark:text-slate-500 text-sm">Log savings/investments to see the breakdown by type.</p>}
                   </div>
                 </div>
               </Card>
+
+              <Card
+                title="Wishlist"
+                description="Things you're saving for. Money is allocated to a specific goal, so progress per item is real rather than the same pot counted several times."
+              >
+                <SavingsGoals
+                  data={savingsGoals}
+                  onChanged={loadData}
+                  showToast={showToast}
+                  setConfirmState={setConfirmState}
+                />
+              </Card>
+              </div>
             )}
 
             {/* Budgets tab */}
@@ -2060,6 +2136,10 @@ export default function Dashboard({ user, profile, setProfile }) {
 
             {activeTab === 'analyze' && (
               <DeepAnalysis showToast={showToast} />
+            )}
+
+            {activeTab === 'help' && (
+              <Help activeTabName={previousTab} showToast={showToast} />
             )}
               </motion.div>
             </AnimatePresence>

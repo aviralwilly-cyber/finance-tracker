@@ -14,6 +14,7 @@ import {
   toMonthlyAmount,
   incomeInEffectOn,
   lastNMonths,
+  goalProgress,
   daysLeftInMonth,
   advanceDate,
   isScotiabankDayToDayStatement,
@@ -94,6 +95,7 @@ async function requireAuth(req, res, next) {
     req.budgetsRef = req.userDocRef.collection('budgets');
     req.chatRef = req.userDocRef.collection('chatHistory');
     req.recurringRef = req.userDocRef.collection('recurring');
+    req.goalsRef = req.userDocRef.collection('savingsGoals');
 
     // Profile lives as fields on the user doc itself (not a subcollection) —
     // it determines which category set this request should use.
@@ -398,6 +400,74 @@ app.delete('/api/profile/gallery/:index', requireAuth, async (req, res) => {
 // Marks the first-run walkthrough as seen. Its own route because the
 // profile POST requires displayName + purpose, and dismissing a tour
 // shouldn't mean resending unrelated fields just to pass validation.
+// --- Support tickets ---
+// Users submit questions; they land in Firestore and surface in the admin
+// panel. Deliberately no email layer yet, so the form is explicit that
+// replies come by email from a human rather than instantly in-app.
+
+app.post('/api/support', requireAuth, async (req, res) => {
+  const { subject, message, context } = req.body;
+  if (!subject || !subject.trim()) {
+    return res.status(400).json({ error: 'subject is required' });
+  }
+  if (!message || !message.trim()) {
+    return res.status(400).json({ error: 'message is required' });
+  }
+
+  const authUser = await auth.getUser(req.uid).catch(() => null);
+
+  const ticket = {
+    fromUid: req.uid,
+    fromEmail: authUser?.email || null,
+    fromName: req.profile.displayName || null,
+    subject: subject.trim().slice(0, 200),
+    message: message.trim().slice(0, 4000),
+    // Optional diagnostic context the client attaches with consent — which
+    // tab they were on, browser, app version. Turns "it didn't work" into
+    // something actually investigable.
+    context: context && typeof context === 'object' ? context : null,
+    status: 'open',
+    createdAt: new Date().toISOString()
+  };
+
+  const ref = await db.collection('supportTickets').add(ticket);
+  res.status(201).json({ id: ref.id, ...ticket });
+});
+
+// A user's own tickets, so they can see what they've already asked.
+app.get('/api/support', requireAuth, async (req, res) => {
+  const snapshot = await db.collection('supportTickets')
+    .where('fromUid', '==', req.uid)
+    .get();
+
+  const tickets = snapshot.docs
+    .map(d => ({ id: d.id, ...d.data() }))
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+
+  res.json(tickets);
+});
+
+app.get('/api/admin/support', requireAuth, requireAdmin, async (req, res) => {
+  const snapshot = await db.collection('supportTickets').get();
+  const tickets = snapshot.docs
+    .map(d => ({ id: d.id, ...d.data() }))
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+
+  res.json({
+    tickets,
+    openCount: tickets.filter(t => t.status === 'open').length
+  });
+});
+
+app.post('/api/admin/support/:id/status', requireAuth, requireAdmin, async (req, res) => {
+  const { status } = req.body;
+  if (!['open', 'resolved'].includes(status)) {
+    return res.status(400).json({ error: "status must be 'open' or 'resolved'" });
+  }
+  await db.collection('supportTickets').doc(req.params.id).set({ status }, { merge: true });
+  res.json({ id: req.params.id, status });
+});
+
 app.post('/api/profile/tour-seen', requireAuth, async (req, res) => {
   await req.userDocRef.set({ hasSeenTour: true }, { merge: true });
   res.status(200).json({ hasSeenTour: true });
@@ -932,6 +1002,103 @@ app.post('/api/savings', requireAuth, async (req, res) => {
 
 app.delete('/api/savings/:id', requireAuth, async (req, res) => {
   await req.savingsRef.doc(req.params.id).delete();
+  res.status(204).end();
+});
+
+
+// --- Savings goals (wishlist) ---
+// Envelope model: each goal holds its own allocated balance. Allocating is
+// an explicit action rather than inferred from total savings, so progress
+// per goal is unambiguous.
+
+app.get('/api/savings/goals', requireAuth, async (req, res) => {
+  const today = new Date().toISOString().slice(0, 10);
+
+  const [goalsSnap, savingsSnap] = await Promise.all([
+    req.goalsRef.get(),
+    req.savingsRef.get()
+  ]);
+
+  // The user's actual recent saving rate, so "you need $400/month" can be
+  // paired with "you're currently managing $180" rather than floating
+  // free of context.
+  const months = lastNMonths(3);
+  const savings = savingsSnap.docs.map(d => d.data());
+  const recentTotal = months.reduce((sum, { month }) =>
+    sum + savings.filter(s => s.date.startsWith(month)).reduce((t, s) => t + s.amount, 0), 0);
+  const recentMonthlySaving = months.length > 0 ? recentTotal / months.length : 0;
+
+  const goals = goalsSnap.docs
+    .map(d => ({ id: d.id, ...d.data() }))
+    .map(g => ({ ...g, progress: goalProgress(g, today, recentMonthlySaving) }))
+    .sort((a, b) => {
+      // Unfinished first, then soonest deadline — the ones needing action.
+      if (a.progress.complete !== b.progress.complete) return a.progress.complete ? 1 : -1;
+      if (!a.targetDate) return 1;
+      if (!b.targetDate) return -1;
+      return a.targetDate < b.targetDate ? -1 : 1;
+    });
+
+  const totalAllocated = goals.reduce((sum, g) => sum + (Number(g.allocated) || 0), 0);
+  const totalSaved = savings.reduce((sum, s) => sum + s.amount, 0);
+
+  res.json({
+    goals,
+    recentMonthlySaving: Number(recentMonthlySaving.toFixed(2)),
+    totalAllocated: Number(totalAllocated.toFixed(2)),
+    // What's saved but not yet earmarked for anything.
+    unallocated: Number((totalSaved - totalAllocated).toFixed(2))
+  });
+});
+
+app.post('/api/savings/goals', requireAuth, async (req, res) => {
+  const { name, targetAmount, targetDate, note } = req.body;
+
+  if (!name || !name.trim()) {
+    return res.status(400).json({ error: 'name is required' });
+  }
+  const target = Number(targetAmount);
+  if (!target || target <= 0) {
+    return res.status(400).json({ error: 'targetAmount must be greater than 0' });
+  }
+
+  const goal = {
+    name: name.trim().slice(0, 120),
+    targetAmount: target,
+    targetDate: targetDate || null,
+    note: (note || '').trim().slice(0, 500),
+    allocated: 0,
+    createdAt: new Date().toISOString()
+  };
+
+  const ref = await req.goalsRef.add(goal);
+  res.status(201).json({ id: ref.id, ...goal });
+});
+
+// Move money into or out of a goal's envelope. Negative amounts withdraw,
+// which matters — plans change, and money shouldn't be trapped once assigned.
+app.post('/api/savings/goals/:id/allocate', requireAuth, async (req, res) => {
+  const amount = Number(req.body.amount);
+  if (!amount || Number.isNaN(amount)) {
+    return res.status(400).json({ error: 'amount is required' });
+  }
+
+  const ref = req.goalsRef.doc(req.params.id);
+  const snap = await ref.get();
+  if (!snap.exists) return res.status(404).json({ error: 'Goal not found' });
+
+  const current = Number(snap.data().allocated) || 0;
+  const next = current + amount;
+  if (next < 0) {
+    return res.status(400).json({ error: "You can't withdraw more than is allocated to this goal." });
+  }
+
+  await ref.set({ allocated: Number(next.toFixed(2)) }, { merge: true });
+  res.json({ id: req.params.id, allocated: Number(next.toFixed(2)) });
+});
+
+app.delete('/api/savings/goals/:id', requireAuth, async (req, res) => {
+  await req.goalsRef.doc(req.params.id).delete();
   res.status(204).end();
 });
 
