@@ -17,11 +17,31 @@ import {
   goalProgress,
   daysLeftInMonth,
   advanceDate,
+  detectRecurringBills,
   isScotiabankDayToDayStatement,
   parseScotiabankDayToDayStatement,
   chunkStatementText
 } from './lib.js';
 import { groq, callGroq, categorize } from './ai.js';
+import {
+  ACCOUNT_TYPES,
+  normalizeAccountType,
+  capabilitiesFor
+} from './domain/accounts.js';
+import { resolveTaxProfile } from './domain/business/rates.js';
+import { normalizeExpenseTax } from './domain/business/expenses.js';
+import { chatPersona, analystPersona } from './domain/prompts.js';
+import { isDomainError } from './domain/errors.js';
+import { invoiceRepo } from './repositories/invoiceRepo.js';
+import { createInvoiceService } from './services/invoiceService.js';
+import { createInvoiceRouter } from './routes/invoices.js';
+import { businessSettingsRepo } from './repositories/businessSettingsRepo.js';
+import { createBusinessSettingsService } from './services/businessSettingsService.js';
+import { createBusinessSettingsRouter } from './routes/business-settings.js';
+import { transactionRepo } from './repositories/transactionRepo.js';
+import { createBusinessOverviewService } from './services/businessOverviewService.js';
+import { createBusinessOverviewRouter } from './routes/business-overview.js';
+import { createBusinessExportRouter } from './routes/business-export.js';
 import {
   logError,
   logFunnelStep,
@@ -101,7 +121,53 @@ async function requireAuth(req, res, next) {
     // it determines which category set this request should use.
     const profileSnap = await req.userDocRef.get();
     req.profile = profileSnap.exists ? profileSnap.data() : {};
-    req.categories = categoriesFor(req.profile.purpose, req.profile.customCategories || []);
+
+    // Categories follow the account TYPE for a business, and the purpose
+    // preference only for personal accounts. `purpose` is a personal
+    // category preference ('self' vs 'other'); it has no meaning for a
+    // business, whose category set is decided by what kind of account it is.
+    // This is what CATEGORY_SETS.business was kept for when 'business' was
+    // removed as a selectable purpose.
+    const rawAccountType = normalizeAccountType(req.profile.accountType);
+    const categoryKey = rawAccountType === 'business' ? 'business' : req.profile.purpose;
+    req.categories = categoriesFor(categoryKey, req.profile.customCategories || []);
+
+    // Request context for the layered code. Services and repositories take
+    // this plain object instead of `req`, which is what lets them be tested
+    // without Express and without Firestore.
+    //
+    // accountId is hardcoded to 'default' because there is exactly one
+    // account per user today. It is in ctx anyway so repositories build
+    // Firestore paths from it rather than from req.uid directly — that keeps
+    // "one login holding both a personal and a business account" a change to
+    // one path-building function plus a backfill, instead of a rewrite of
+    // every query in the app.
+    //
+    // accountType absent means personal, so every profile created before
+    // business accounts existed resolves correctly with no migration.
+    const accountType = rawAccountType;
+    req.ctx = {
+      uid: req.uid,
+      accountId: 'default',
+      accountType,
+      capabilities: capabilitiesFor(accountType),
+      // Sales-tax registration and the income-tax reserve rate are per-user
+      // settings, so they travel with the context rather than being read from
+      // a constant. Defaults apply until a business account configures them.
+      // province lives at the profile root, not inside taxProfile, so it is
+      // merged in here — the component list is derived from it.
+      // province is normally stored inside taxProfile. The root-level field
+      // is a fallback for profiles written before that moved, and loses to
+      // taxProfile.province when both exist.
+      taxProfile: resolveTaxProfile({
+        province: req.profile.province,
+        ...(req.profile.taxProfile || {})
+      }),
+      // Only ever 'soleProp' today — normalizeBusinessSettings refuses to
+      // store anything the tax math cannot honour — but read from the profile
+      // rather than hardcoded, so the seam is already in place.
+      businessStructure: req.profile.businessStructure || 'soleProp'
+    };
 
     // Activity tracking for admin analytics. Throttled to at most one write
     // per hour per user — without this, every single API call would issue a
@@ -119,6 +185,53 @@ async function requireAuth(req, res, next) {
     res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
+
+// --- Feature authorization ---
+//
+// Express mounts routers once at boot, so a business-only router cannot be
+// conditionally mounted per request. This is the per-request gate instead.
+//
+// Returns 404 rather than 403, matching requireAdmin above and for the same
+// reason: a personal account should not be able to enumerate which business
+// endpoints exist by reading status codes.
+//
+// Hiding a tab in the frontend is cosmetic. This is the enforcement.
+function requireCapability(capability) {
+  return function (req, res, next) {
+    if (!req.ctx?.capabilities.includes(capability)) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    next();
+  };
+}
+
+// --- Layered routers ---
+//
+// New feature areas are built as routes -> services -> repositories and
+// mounted here. The monolithic routes below stay exactly as they are; the two
+// styles coexist deliberately, and existing code migrates only when it is
+// being touched for another reason.
+app.use('/api/invoices', createInvoiceRouter({
+  requireAuth,
+  requireCapability,
+  service: createInvoiceService({ repo: invoiceRepo })
+}));
+
+app.use('/api/business/settings', createBusinessSettingsRouter({
+  requireAuth,
+  requireCapability,
+  service: createBusinessSettingsService({ repo: businessSettingsRepo })
+}));
+
+app.use('/api/business/overview', createBusinessOverviewRouter({
+  requireAuth,
+  requireCapability,
+  service: createBusinessOverviewService({ invoiceRepo, transactionRepo })
+}));
+
+app.use('/api/business/export', createBusinessExportRouter({
+  requireAuth, requireCapability, invoiceRepo, transactionRepo
+}));
 
 // --- Admin authorization ---
 //
@@ -240,12 +353,17 @@ ${chunkText}`;
   }
 }
 
-async function chatAboutFinances(question, transactionsSummary, incomeContext, savingsContext, historyContext) {
+async function chatAboutFinances(question, transactionsSummary, incomeContext, savingsContext, historyContext, persona) {
   if (!groq) {
     return "AI chat isn't configured yet — set GROQ_API_KEY on the backend.";
   }
 
-  const prompt = `You are a helpful personal finance assistant. Here is a summary of the user's recent transactions (date, category, amount, description):
+  // Framing comes from domain/prompts.js: the same question means different
+  // things for a salaried person and a freelancer, and this function should
+  // not have to know what an account type is.
+  const prompt = `${persona}
+
+Here is a summary of recent transactions (date, category, amount, description):
 
 ${transactionsSummary}
 
@@ -254,12 +372,6 @@ ${incomeContext}
 ${savingsContext}
 
 ${historyContext}
-
-Answer the user's question using only this data. Be concise and specific with numbers.
-Respond in plain conversational sentences only — do NOT use markdown tables, pipe characters,
-bullet lists, or headers. If the user's question refers back to something from the recent
-conversation (like "how about August?" after asking about July), use that context to understand
-what they mean.
 
 Question: ${question}`;
 
@@ -306,6 +418,11 @@ app.get('/api/profile', requireAuth, async (req, res) => {
   res.json({
     displayName: req.profile.displayName || null,
     purpose: req.profile.purpose || null,
+    // The frontend renders navigation from this list rather than hardcoding
+    // which tabs exist per account type — one source of truth, so the two
+    // can't drift.
+    accountType: req.ctx.accountType,
+    capabilities: req.ctx.capabilities,
     phoneNumber: req.profile.phoneNumber || '',
     budgetNudgeThreshold: req.profile.budgetNudgeThreshold ?? 80,
     customCategories: req.profile.customCategories || [],
@@ -327,17 +444,56 @@ app.post('/api/profile', requireAuth, async (req, res) => {
   // themselves to admin with a single crafted request.
   const {
     displayName, purpose, phoneNumber, budgetNudgeThreshold, photoURL, avatarEmoji,
-    employmentType, jobTitle, financialGoal
+    employmentType, jobTitle, financialGoal, accountType, incomeSources
   } = req.body;
 
   if (!displayName || !displayName.trim()) {
     return res.status(400).json({ error: 'displayName is required' });
   }
-  if (!['self', 'business', 'other'].includes(purpose)) {
+
+  // `purpose` picks between the personal category sets, so a business account
+  // has no meaningful answer for it. Omitting it now falls back to whatever is
+  // stored, then to 'self' — rather than forcing onboarding to invent a value
+  // for a question it never asked.
+  const effectivePurpose = purpose ?? req.profile.purpose ?? 'self';
+  if (!['self', 'business', 'other'].includes(effectivePurpose)) {
     return res.status(400).json({ error: "purpose must be 'self', 'business', or 'other'" });
   }
 
-  const update = { displayName: displayName.trim(), purpose };
+  const update = { displayName: displayName.trim(), purpose: effectivePurpose };
+
+  // Where a student's money actually comes from. Salary/hourly is the wrong
+  // question for someone on an allowance, and the answer changes what the
+  // rest of the app should ask them.
+  if (incomeSources !== undefined) {
+    if (!Array.isArray(incomeSources) || incomeSources.some(v => typeof v !== 'string')) {
+      return res.status(400).json({ error: 'incomeSources must be an array of strings' });
+    }
+    update.incomeSources = incomeSources.slice(0, 6).map(v => v.trim()).filter(Boolean);
+  }
+
+  // accountType is write-once: set during onboarding, never changed after.
+  //
+  // Switching would orphan the previous type's data — budgets, savings goals
+  // and household membership on one side, invoices and clients on the other —
+  // and every "just let them switch" design turns out to be multi-account
+  // support wearing a disguise. A genuine misclick is fixable by an admin,
+  // which is a rare enough path to not belong in the product surface.
+  if (accountType !== undefined) {
+    if (!ACCOUNT_TYPES.includes(accountType)) {
+      return res.status(400).json({
+        error: `accountType must be one of ${ACCOUNT_TYPES.join(', ')}`
+      });
+    }
+    const existing = req.profile.accountType;
+    if (existing && existing !== accountType) {
+      return res.status(409).json({
+        error: 'accountType cannot be changed once it is set.',
+        code: 'account_type_immutable'
+      });
+    }
+    if (!existing) update.accountType = accountType;
+  }
 
   if (phoneNumber !== undefined) update.phoneNumber = phoneNumber.trim();
   if (photoURL !== undefined) update.photoURL = photoURL;
@@ -559,25 +715,45 @@ app.get('/api/transactions', requireAuth, async (req, res) => {
 
 // Shared by the manual-add and quick-add routes: categorize if needed, save,
 // return the created transaction with its new id.
-async function createTransaction(req, { description, amount, date, category }) {
+async function createTransaction(req, { description, amount, date, category, ...rest }) {
   let finalCategory = category;
   if (!finalCategory || !finalCategory.trim()) {
     finalCategory = await categorize(description, amount, req.categories);
   }
   const transaction = { description, amount: Number(amount), date, category: finalCategory };
+
+  // Business accounts store the extra fields the tax math needs. Personal
+  // transactions are written exactly as before — no new keys, no migration,
+  // and nothing for the personal side to ignore.
+  if (req.ctx?.accountType === 'business') {
+    Object.assign(transaction, normalizeExpenseTax(
+      { amount, ...rest },
+      req.ctx.taxProfile,
+      { date }
+    ));
+  }
+
   const docRef = await req.transactionsRef.add(transaction);
   return { id: docRef.id, ...transaction };
 }
 
 app.post('/api/transactions', requireAuth, async (req, res) => {
-  const { description, amount, date, category } = req.body;
+  const { description, amount, date, category, deductiblePercent, salesTaxIncluded, taxPaid } = req.body;
 
   if (!description || amount === undefined || !date) {
     return res.status(400).json({ error: 'description, amount, and date are required' });
   }
 
-  const transaction = await createTransaction(req, { description, amount, date, category });
-  res.status(201).json(transaction);
+  try {
+    const transaction = await createTransaction(req, {
+      description, amount, date, category,
+      deductiblePercent, salesTaxIncluded, taxPaid
+    });
+    res.status(201).json(transaction);
+  } catch (err) {
+    if (isDomainError(err)) return res.status(err.status).json({ error: err.message });
+    throw err;
+  }
 });
 
 // Natural-language quick-add: "Starbucks 5.50 today" → a real transaction.
@@ -809,6 +985,39 @@ app.get('/api/transactions/summary', requireAuth, async (req, res) => {
 // A rule creates real transactions automatically when its due date arrives —
 // it doesn't just remind you, it actually logs them (e.g. rent every month).
 
+// --- Recurring bill detection ---
+// Scans transaction history for repeating charges the user hasn't set up
+// as recurring yet. Entirely deterministic (see lib.js) — the signal is
+// structural (same merchant, steady amount, even spacing), which is
+// exactly the kind of pattern code handles better than a language model,
+// and it means every suggestion can explain WHY it was flagged.
+
+app.get('/api/recurring/suggestions', requireAuth, async (req, res) => {
+  const [txSnapshot, recurringSnapshot] = await Promise.all([
+    req.transactionsRef.get(),
+    req.recurringRef.get()
+  ]);
+
+  const transactions = txSnapshot.docs.map(d => d.data());
+  const existing = recurringSnapshot.docs.map(d => d.data());
+  const today = new Date().toISOString().slice(0, 10);
+
+  // Nothing to find in a near-empty history — say so rather than
+  // returning an empty list that looks like "no bills detected".
+  if (transactions.length < 10) {
+    return res.json({
+      suggestions: [],
+      insufficientData: true,
+      message: 'Log or import a few months of transactions and repeating bills will show up here automatically.'
+    });
+  }
+
+  res.json({
+    suggestions: detectRecurringBills(transactions, existing, today),
+    insufficientData: false
+  });
+});
+
 app.get('/api/recurring', requireAuth, async (req, res) => {
   const snapshot = await req.recurringRef.orderBy('nextDueDate', 'asc').get();
   const rules = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -894,12 +1103,18 @@ app.post('/api/chat', requireAuth, async (req, res) => {
 
   const today = new Date().toISOString().slice(0, 10);
 
+  const isBusiness = req.ctx.accountType === 'business';
+
+  // A business account has no income or savings collections — those routes
+  // 404 for it — so the second and third slots carry invoice context instead.
   const [txSnapshot, incomeSnapshot, savingsSnapshot, historySnapshot] = await Promise.all([
     req.transactionsRef.orderBy('date', 'desc').get(),
-    req.incomeRef.get(),
-    req.savingsRef.get(),
+    isBusiness ? Promise.resolve(null) : req.incomeRef.get(),
+    isBusiness ? Promise.resolve(null) : req.savingsRef.get(),
     req.chatRef.orderBy('createdAt', 'desc').limit(6).get() // last 6 Q&A exchanges
   ]);
+
+  const invoices = isBusiness ? await invoiceRepo.list(req.ctx) : [];
 
   const summary = txSnapshot.docs
     .map(doc => {
@@ -908,18 +1123,34 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     })
     .join('\n');
 
-  const incomeEntries = incomeSnapshot.docs.map(doc => doc.data());
+  const incomeEntries = isBusiness ? [] : incomeSnapshot.docs.map(doc => doc.data());
   const activeIncome = incomeInEffectOn(incomeEntries, today);
-  const incomeContext = activeIncome
-    ? `The user's current income is $${activeIncome.amount} (${activeIncome.frequency}), which is about $${toMonthlyAmount(activeIncome.amount, activeIncome.frequency).toFixed(2)}/month.`
-    : 'The user has not set up their income yet.';
+  const incomeContext = isBusiness
+    ? (invoices.length > 0
+        ? 'Invoices (issued date, client, subtotal excluding tax, total including tax, paid date or UNPAID):\n' +
+          invoices.map(i => {
+            const tax = Object.entries(i.taxCollected || {})
+              .map(([code, amt]) => `${code} $${amt}`).join(' + ') || 'no sales tax';
+            return `${i.issuedDate} | ${i.clientName} | subtotal $${i.subtotal} | ${tax} | total $${i.total} | ${i.paidDate ? `paid ${i.paidDate}` : 'UNPAID'}`;
+          }).join('\n')
+        : 'No invoices have been created yet.')
+    : (activeIncome
+        ? `The user's current income is $${activeIncome.amount} (${activeIncome.frequency}), which is about $${toMonthlyAmount(activeIncome.amount, activeIncome.frequency).toFixed(2)}/month.`
+        : 'The user has not set up their income yet.');
 
-  const savingsEntries = savingsSnapshot.docs.map(doc => doc.data());
+  const savingsEntries = isBusiness ? [] : savingsSnapshot.docs.map(doc => doc.data());
   const totalSaved = savingsEntries.reduce((sum, s) => sum + s.amount, 0);
-  const savingsContext = savingsEntries.length > 0
-    ? `The user has saved/invested a total of $${totalSaved.toFixed(2)} across these entries:\n` +
-      savingsEntries.map(s => `${s.date} | ${s.type} | $${s.amount} | ${s.description}`).join('\n')
-    : 'The user has not logged any savings or investments yet.';
+  const savingsContext = isBusiness
+    ? `This business operates in ${req.ctx.taxProfile.province}. ` +
+      (req.ctx.taxProfile.salesTaxRegistered
+        ? `It is registered to collect ${req.ctx.taxProfile.components.map(c => c.code).join(' and ')}. `
+        : 'It is not registered to collect sales tax, so invoices carry none. ') +
+      `It sets aside ${req.ctx.taxProfile.incomeTaxReservePercent}% of net profit for income tax. ` +
+      'Expenses above are tax-inclusive amounts; deductible amounts may be lower.'
+    : (savingsEntries.length > 0
+        ? `The user has saved/invested a total of $${totalSaved.toFixed(2)} across these entries:\n` +
+          savingsEntries.map(s => `${s.date} | ${s.type} | $${s.amount} | ${s.description}`).join('\n')
+        : 'The user has not logged any savings or investments yet.');
 
   // Recent exchanges give the model context for follow-ups like "how about
   // August?" — without this, every question was answered in total isolation.
@@ -929,7 +1160,10 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       recentHistory.map(h => `User: ${h.question}\nAssistant: ${h.answer}`).join('\n')
     : '';
 
-  const answer = await chatAboutFinances(question, summary, incomeContext, savingsContext, historyContext);
+  const answer = await chatAboutFinances(
+    question, summary, incomeContext, savingsContext, historyContext,
+    chatPersona(req.ctx.accountType)
+  );
 
   // Persist this exchange so it survives a page refresh and informs future context.
   await req.chatRef.add({ question, answer, createdAt: new Date().toISOString() });
@@ -951,13 +1185,13 @@ app.delete('/api/chat/history', requireAuth, async (req, res) => {
 
 // --- Income routes ---
 
-app.get('/api/income', requireAuth, async (req, res) => {
+app.get('/api/income', requireAuth, requireCapability('income'), async (req, res) => {
   const snapshot = await req.incomeRef.orderBy('effectiveDate', 'desc').get();
   const income = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
   res.json(income);
 });
 
-app.post('/api/income', requireAuth, async (req, res) => {
+app.post('/api/income', requireAuth, requireCapability('income'), async (req, res) => {
   const { amount, frequency, effectiveDate } = req.body;
 
   if (amount === undefined || !frequency || !effectiveDate) {
@@ -972,20 +1206,20 @@ app.post('/api/income', requireAuth, async (req, res) => {
   res.status(201).json({ id: docRef.id, ...entry });
 });
 
-app.delete('/api/income/:id', requireAuth, async (req, res) => {
+app.delete('/api/income/:id', requireAuth, requireCapability('income'), async (req, res) => {
   await req.incomeRef.doc(req.params.id).delete();
   res.status(204).end();
 });
 
 // --- Savings / investments routes ---
 
-app.get('/api/savings', requireAuth, async (req, res) => {
+app.get('/api/savings', requireAuth, requireCapability('savings'), async (req, res) => {
   const snapshot = await req.savingsRef.orderBy('date', 'desc').get();
   const savings = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
   res.json(savings);
 });
 
-app.post('/api/savings', requireAuth, async (req, res) => {
+app.post('/api/savings', requireAuth, requireCapability('savings'), async (req, res) => {
   const { type, description, amount, date } = req.body;
 
   if (!type || amount === undefined || !date) {
@@ -1000,7 +1234,7 @@ app.post('/api/savings', requireAuth, async (req, res) => {
   res.status(201).json({ id: docRef.id, ...entry });
 });
 
-app.delete('/api/savings/:id', requireAuth, async (req, res) => {
+app.delete('/api/savings/:id', requireAuth, requireCapability('savings'), async (req, res) => {
   await req.savingsRef.doc(req.params.id).delete();
   res.status(204).end();
 });
@@ -1011,7 +1245,7 @@ app.delete('/api/savings/:id', requireAuth, async (req, res) => {
 // an explicit action rather than inferred from total savings, so progress
 // per goal is unambiguous.
 
-app.get('/api/savings/goals', requireAuth, async (req, res) => {
+app.get('/api/savings/goals', requireAuth, requireCapability('savings'), async (req, res) => {
   const today = new Date().toISOString().slice(0, 10);
 
   const [goalsSnap, savingsSnap] = await Promise.all([
@@ -1051,7 +1285,7 @@ app.get('/api/savings/goals', requireAuth, async (req, res) => {
   });
 });
 
-app.post('/api/savings/goals', requireAuth, async (req, res) => {
+app.post('/api/savings/goals', requireAuth, requireCapability('savings'), async (req, res) => {
   const { name, targetAmount, targetDate, note } = req.body;
 
   if (!name || !name.trim()) {
@@ -1077,7 +1311,7 @@ app.post('/api/savings/goals', requireAuth, async (req, res) => {
 
 // Move money into or out of a goal's envelope. Negative amounts withdraw,
 // which matters — plans change, and money shouldn't be trapped once assigned.
-app.post('/api/savings/goals/:id/allocate', requireAuth, async (req, res) => {
+app.post('/api/savings/goals/:id/allocate', requireAuth, requireCapability('savings'), async (req, res) => {
   const amount = Number(req.body.amount);
   if (!amount || Number.isNaN(amount)) {
     return res.status(400).json({ error: 'amount is required' });
@@ -1097,12 +1331,12 @@ app.post('/api/savings/goals/:id/allocate', requireAuth, async (req, res) => {
   res.json({ id: req.params.id, allocated: Number(next.toFixed(2)) });
 });
 
-app.delete('/api/savings/goals/:id', requireAuth, async (req, res) => {
+app.delete('/api/savings/goals/:id', requireAuth, requireCapability('savings'), async (req, res) => {
   await req.goalsRef.doc(req.params.id).delete();
   res.status(204).end();
 });
 
-app.get('/api/savings/summary', requireAuth, async (req, res) => {
+app.get('/api/savings/summary', requireAuth, requireCapability('savings'), async (req, res) => {
   const snapshot = await req.savingsRef.get();
   const summary = {};
   snapshot.docs.forEach(doc => {
@@ -1118,13 +1352,13 @@ app.get('/api/savings/summary', requireAuth, async (req, res) => {
 // adjust occasionally, not something that needs to be reconstructed for
 // past months.
 
-app.get('/api/budgets', requireAuth, async (req, res) => {
+app.get('/api/budgets', requireAuth, requireCapability('budgets'), async (req, res) => {
   const snapshot = await req.budgetsRef.get();
   const budgets = snapshot.docs.map(doc => ({ category: doc.id, ...doc.data() }));
   res.json(budgets);
 });
 
-app.post('/api/budgets', requireAuth, async (req, res) => {
+app.post('/api/budgets', requireAuth, requireCapability('budgets'), async (req, res) => {
   const { category, limit } = req.body;
 
   if (!category || limit === undefined) {
@@ -1140,7 +1374,7 @@ app.post('/api/budgets', requireAuth, async (req, res) => {
   res.status(200).json({ category, limit: Number(limit) });
 });
 
-app.delete('/api/budgets/:category', requireAuth, async (req, res) => {
+app.delete('/api/budgets/:category', requireAuth, requireCapability('budgets'), async (req, res) => {
   await req.budgetsRef.doc(req.params.category).delete();
   res.status(204).end();
 });
@@ -1148,7 +1382,7 @@ app.delete('/api/budgets/:category', requireAuth, async (req, res) => {
 // Combines budgets with this month's actual spending per category, computes
 // percent used, and asks the AI for a short nudge if anything's close to or
 // over its limit. All the math is deterministic; only the sentence is AI.
-app.get('/api/budgets/progress', requireAuth, async (req, res) => {
+app.get('/api/budgets/progress', requireAuth, requireCapability('budgets'), async (req, res) => {
   const today = new Date().toISOString().slice(0, 10);
   const currentMonth = today.slice(0, 7);
 
@@ -1239,7 +1473,7 @@ app.get('/api/overview', requireAuth, async (req, res) => {
 // months — this is what lets you see "did my salary actually go up in
 // October?" and "did my spending track it?" instead of only ever seeing
 // the current month in isolation.
-app.get('/api/trend', requireAuth, async (req, res) => {
+app.get('/api/trend', requireAuth, requireCapability('income'), async (req, res) => {
   const months = lastNMonths(6);
 
   const [incomeSnapshot, txSnapshot, savingsSnapshot] = await Promise.all([
@@ -1277,7 +1511,7 @@ app.get('/api/trend', requireAuth, async (req, res) => {
 // ever asked to narrate numbers that were already computed, never to do
 // the arithmetic itself.
 
-app.get('/api/predict/baseline', requireAuth, async (req, res) => {
+app.get('/api/predict/baseline', requireAuth, requireCapability('predict'), async (req, res) => {
   const monthsBack = 3;
   const cutoff = new Date();
   cutoff.setMonth(cutoff.getMonth() - monthsBack);
@@ -1312,7 +1546,7 @@ app.get('/api/predict/baseline', requireAuth, async (req, res) => {
 // Client already computed both the baseline and scenario final numbers
 // using the same deterministic formula — this endpoint's only job is
 // turning those two numbers into a plain-language sentence.
-app.post('/api/predict/narrate', requireAuth, async (req, res) => {
+app.post('/api/predict/narrate', requireAuth, requireCapability('predict'), async (req, res) => {
   const { adjustments, incomeDeltaPercent, months, baselineFinal, scenarioFinal } = req.body;
 
   if (!groq) {
@@ -1373,7 +1607,7 @@ app.post('/api/analyze', requireAuth, async (req, res) => {
   }
 });
 
-app.get('/api/health-score', requireAuth, async (req, res) => {
+app.get('/api/health-score', requireAuth, requireCapability('health-score'), async (req, res) => {
   const months = lastNMonths(3);
   const today = new Date().toISOString().slice(0, 10);
   const currentMonth = today.slice(0, 7);
@@ -1486,7 +1720,7 @@ their weakest area. Use only the numbers given — do not recalculate anything.`
 // confirmed members of the same household document — the Admin SDK can
 // read any user's data, so that verification step is what keeps this safe.
 
-app.post('/api/household/invite', requireAuth, async (req, res) => {
+app.post('/api/household/invite', requireAuth, requireCapability('household'), async (req, res) => {
   const { email } = req.body;
   if (!email || !email.trim()) {
     return res.status(400).json({ error: 'email is required' });
@@ -1542,7 +1776,7 @@ app.post('/api/household/invite', requireAuth, async (req, res) => {
   res.status(201).json({ id: inviteRef.id });
 });
 
-app.get('/api/household/invites', requireAuth, async (req, res) => {
+app.get('/api/household/invites', requireAuth, requireCapability('household'), async (req, res) => {
   const [receivedSnap, sentSnap] = await Promise.all([
     db.collection('householdInvites').where('toUid', '==', req.uid).where('status', '==', 'pending').get(),
     db.collection('householdInvites').where('fromUid', '==', req.uid).where('status', '==', 'pending').get()
@@ -1556,7 +1790,7 @@ app.get('/api/household/invites', requireAuth, async (req, res) => {
   });
 });
 
-app.delete('/api/household/invites/:id', requireAuth, async (req, res) => {
+app.delete('/api/household/invites/:id', requireAuth, requireCapability('household'), async (req, res) => {
   const inviteRef = db.collection('householdInvites').doc(req.params.id);
   const snap = await inviteRef.get();
   if (!snap.exists) return res.status(404).json({ error: 'Invite not found' });
@@ -1566,7 +1800,7 @@ app.delete('/api/household/invites/:id', requireAuth, async (req, res) => {
   res.status(204).end();
 });
 
-app.post('/api/household/invites/:id/accept', requireAuth, async (req, res) => {
+app.post('/api/household/invites/:id/accept', requireAuth, requireCapability('household'), async (req, res) => {
   const inviteRef = db.collection('householdInvites').doc(req.params.id);
   const inviteSnap = await inviteRef.get();
   if (!inviteSnap.exists) return res.status(404).json({ error: 'Invite not found' });
@@ -1616,7 +1850,7 @@ app.post('/api/household/invites/:id/accept', requireAuth, async (req, res) => {
   res.json({ householdId });
 });
 
-app.post('/api/household/invites/:id/decline', requireAuth, async (req, res) => {
+app.post('/api/household/invites/:id/decline', requireAuth, requireCapability('household'), async (req, res) => {
   const inviteRef = db.collection('householdInvites').doc(req.params.id);
   const inviteSnap = await inviteRef.get();
   if (!inviteSnap.exists) return res.status(404).json({ error: 'Invite not found' });
@@ -1626,7 +1860,7 @@ app.post('/api/household/invites/:id/decline', requireAuth, async (req, res) => 
   res.status(204).end();
 });
 
-app.get('/api/household', requireAuth, async (req, res) => {
+app.get('/api/household', requireAuth, requireCapability('household'), async (req, res) => {
   if (!req.profile.householdId) {
     return res.json({ household: null });
   }
@@ -1650,7 +1884,7 @@ app.get('/api/household', requireAuth, async (req, res) => {
   res.json({ household: { id: req.profile.householdId, members: memberInfo } });
 });
 
-app.delete('/api/household/leave', requireAuth, async (req, res) => {
+app.delete('/api/household/leave', requireAuth, requireCapability('household'), async (req, res) => {
   if (!req.profile.householdId) {
     return res.status(400).json({ error: 'Not in a household' });
   }
@@ -1682,7 +1916,7 @@ app.delete('/api/household/leave', requireAuth, async (req, res) => {
 // Current-month spending per household member. Read-only: each member's
 // own transactions stay theirs, this only aggregates totals and category
 // breakdowns for a shared view.
-app.get('/api/household/spending', requireAuth, async (req, res) => {
+app.get('/api/household/spending', requireAuth, requireCapability('household'), async (req, res) => {
   if (!req.profile.householdId) {
     return res.status(400).json({ error: 'Not in a household' });
   }
@@ -1765,7 +1999,7 @@ async function requireHouseholdMember(req, res) {
   return { ref, data: snap.data() };
 }
 
-app.get('/api/household/bills', requireAuth, async (req, res) => {
+app.get('/api/household/bills', requireAuth, requireCapability('household'), async (req, res) => {
   const household = await requireHouseholdMember(req, res);
   if (!household) return;
 
@@ -1773,7 +2007,7 @@ app.get('/api/household/bills', requireAuth, async (req, res) => {
   res.json(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
 });
 
-app.post('/api/household/bills', requireAuth, async (req, res) => {
+app.post('/api/household/bills', requireAuth, requireCapability('household'), async (req, res) => {
   const household = await requireHouseholdMember(req, res);
   if (!household) return;
 
@@ -1803,7 +2037,7 @@ app.post('/api/household/bills', requireAuth, async (req, res) => {
   res.status(201).json({ id: docRef.id, ...bill });
 });
 
-app.post('/api/household/bills/:id/paid', requireAuth, async (req, res) => {
+app.post('/api/household/bills/:id/paid', requireAuth, requireCapability('household'), async (req, res) => {
   const household = await requireHouseholdMember(req, res);
   if (!household) return;
 
@@ -1812,7 +2046,7 @@ app.post('/api/household/bills/:id/paid', requireAuth, async (req, res) => {
   res.json({ id: req.params.id, paid: !!paid });
 });
 
-app.delete('/api/household/bills/:id', requireAuth, async (req, res) => {
+app.delete('/api/household/bills/:id', requireAuth, requireCapability('household'), async (req, res) => {
   const household = await requireHouseholdMember(req, res);
   if (!household) return;
 
@@ -1824,7 +2058,7 @@ app.delete('/api/household/bills/:id', requireAuth, async (req, res) => {
 // Plain messages between members. Not AI-backed — this is people talking
 // to each other about shared costs, which doesn't need a model involved.
 
-app.get('/api/household/messages', requireAuth, async (req, res) => {
+app.get('/api/household/messages', requireAuth, requireCapability('household'), async (req, res) => {
   const household = await requireHouseholdMember(req, res);
   if (!household) return;
 
@@ -1835,7 +2069,7 @@ app.get('/api/household/messages', requireAuth, async (req, res) => {
   res.json(snapshot.docs.map(d => ({ id: d.id, ...d.data() })).reverse());
 });
 
-app.post('/api/household/messages', requireAuth, async (req, res) => {
+app.post('/api/household/messages', requireAuth, requireCapability('household'), async (req, res) => {
   const household = await requireHouseholdMember(req, res);
   if (!household) return;
 
