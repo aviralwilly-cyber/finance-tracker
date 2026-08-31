@@ -21,6 +21,7 @@
 
 import { logAiUsage, logError } from './telemetry.js';
 import { toMonthlyAmount, incomeInEffectOn, lastNMonths } from './lib.js';
+import { analystPersona } from './domain/prompts.js';
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 
@@ -30,12 +31,14 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 // if analysis quality proves insufficient.
 const MODEL = 'nvidia/nemotron-3-super-120b-a12b:free';
 
-// An agent that can loop forever is a runaway API bill and a hung request.
-// Started at 6, but in practice the model used all six gathering data and
-// never got a turn to answer — 10 leaves room to investigate AND conclude.
-// If it still runs out, the forced-synthesis call at the end of the loop
-// makes sure the gathered data isn't wasted.
-const MAX_TOOL_ROUNDS = 10;
+// Each round is a SEPARATE OpenRouter request, and the free tier meters
+// requests per day (~200), not tokens. At 10 rounds plus a synthesis call,
+// a single analysis could consume ~11 requests — roughly 18 analyses would
+// exhaust a whole day's quota, which is how this hit the limit unexpectedly.
+//
+// 5 still allows plan → 3-4 queries → answer, and the forced-synthesis call
+// below guarantees a real answer even if the model wants to keep digging.
+const MAX_TOOL_ROUNDS = 5;
 
 export const agentAvailable = !!OPENROUTER_API_KEY;
 
@@ -186,14 +189,38 @@ async function callOpenRouter(messages, tools) {
 
   if (!response.ok) {
     const body = await response.text();
+    // Log the failed request too — a 429 still counts against the quota,
+    // and silently dropping it makes the usage panel wrong exactly when
+    // it matters most.
+    logAiUsage({
+      feature: 'deep_analysis', model: MODEL, provider: 'openrouter',
+      ok: false,
+      errorCode: response.status === 429 ? 'rate_limit_exceeded' : `http_${response.status}`
+    });
     const err = new Error(`OpenRouter ${response.status}: ${body.slice(0, 200)}`);
     err.status = response.status;
     throw err;
   }
-  return response.json();
+
+  const data = await response.json();
+
+  // IMPORTANT: log per REQUEST, not per analysis. OpenRouter's free tier
+  // meters requests/day, and one analysis makes one request per tool round
+  // — so logging once at the end undercounted usage by ~10x and made the
+  // admin quota gauge useless.
+  logAiUsage({
+    feature: 'deep_analysis', model: MODEL, provider: 'openrouter',
+    promptTokens: data.usage?.prompt_tokens,
+    completionTokens: data.usage?.completion_tokens,
+    ok: true
+  });
+
+  return data;
 }
 
-const SYSTEM_PROMPT = `You are a financial analyst reviewing one person's own financial data.
+// The persona line varies by account type; everything below it is the same
+// discipline regardless of whose books are being read.
+const systemPromptFor = (accountType) => `${analystPersona(accountType)}
 
 Work in steps: call the tools you need, look at what comes back, and call more
 if the answer raises a new question.
@@ -223,7 +250,7 @@ export async function runFinancialAgent(question, req) {
   }
 
   const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: systemPromptFor(req.ctx?.accountType) },
     { role: 'user', content: question }
   ];
   const trace = [];
@@ -245,10 +272,6 @@ export async function runFinancialAgent(question, req) {
       const toolCalls = message.tool_calls || [];
       if (toolCalls.length === 0) {
         // No more tools wanted — this is the final analysis.
-        logAiUsage({
-          feature: 'deep_analysis', model: MODEL, provider: 'openrouter',
-          promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens, ok: true
-        });
         return { analysis: message.content || '', trace, toolCallCount: trace.length };
       }
 
@@ -288,12 +311,6 @@ export async function runFinancialAgent(question, req) {
     totalCompletionTokens += finalData.usage?.completion_tokens || 0;
     const finalMessage = finalData.choices?.[0]?.message?.content || '';
 
-    logAiUsage({
-      feature: 'deep_analysis', model: MODEL, provider: 'openrouter',
-      promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens,
-      ok: !!finalMessage,
-      errorCode: finalMessage ? 'forced_synthesis' : 'max_rounds_exceeded'
-    });
 
     return {
       analysis: finalMessage || "I gathered the data but couldn't summarise it. Try asking something more specific.",
@@ -301,11 +318,6 @@ export async function runFinancialAgent(question, req) {
       toolCallCount: trace.length
     };
   } catch (err) {
-    logAiUsage({
-      feature: 'deep_analysis', model: MODEL, provider: 'openrouter',
-      promptTokens: totalPromptTokens, completionTokens: totalCompletionTokens,
-      ok: false, errorCode: err.status === 429 ? 'rate_limit_exceeded' : 'error'
-    });
     logError({ feature: 'deep_analysis', message: err.message, uid: req.uid });
     throw err;
   }
