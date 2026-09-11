@@ -4,10 +4,58 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <title>AI Finance Tracker</title>
+
+    <title>AI Finance Tracker — open-source personal budgeting demo</title>
+
+    <meta
+      name="description"
+      content="An open-source personal budgeting demo app. Log your own transactions by hand, set category budgets, and ask questions about your spending. Not a bank, and not connected to any financial institution."
+    />
+    <meta name="author" content="Aviral" />
+    <meta name="robots" content="index, follow" />
+    <link rel="canonical" href="https://finance-tracker-pi-five-59.vercel.app/" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="AI Finance Tracker" />
+    <meta property="og:title" content="AI Finance Tracker — open-source personal budgeting demo" />
+    <meta
+      property="og:description"
+      content="A hobby project for tracking your own manually-entered spending. Source code on GitHub. Not affiliated with any bank."
+    />
+    <meta property="og:url" content="https://finance-tracker-pi-five-59.vercel.app/" />
   </head>
   <body>
     <div id="root"></div>
+
+    <noscript>
+      <div style="max-width: 640px; margin: 3rem auto; padding: 0 1.5rem; font-family: system-ui, sans-serif; line-height: 1.6; color: #e6f1ff; background: #0a192f;">
+        <h1>AI Finance Tracker</h1>
+        <p>
+          This is a free, open-source personal budgeting project built by an
+          independent developer as a portfolio piece. It lets you record your own
+          spending by hand, group it into categories, set monthly limits, and ask
+          plain-English questions about the numbers you entered.
+        </p>
+        <p>
+          <strong>This site is not a bank and is not affiliated with, endorsed by,
+          or connected to any bank, card network, or payment provider.</strong>
+          It will never ask for online banking credentials, card numbers, account
+          numbers, or government ID. The only account it creates is an ordinary
+          email-and-password login for this app itself, handled by Firebase
+          Authentication.
+        </p>
+        <p>
+          The full source code is public at
+          <a href="https://github.com/aviralwilly-cyber/finance-tracker" style="color: #64ffda;">github.com/aviralwilly-cyber/finance-tracker</a>.
+        </p>
+        <p>
+          <a href="/about.html" style="color: #64ffda;">About this project</a> ·
+          <a href="/privacy.html" style="color: #64ffda;">Privacy policy</a>
+        </p>
+        <p>The app itself requires JavaScript to run.</p>
+      </div>
+    </noscript>
+
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>Privacy policy — AI Finance Tracker</title>
+    <meta
+      name="description"
+      content="What data AI Finance Tracker collects, where it is stored, who it is shared with, and how to export or delete it."
+    />
+    <style>
+      body {
+        margin: 0;
+        background: #0a192f;
+        color: #e6f1ff;
+        font-family: system-ui, sans-serif;
+        line-height: 1.65;
+      }
+      main { max-width: 680px; margin: 0 auto; padding: 3rem 1.5rem 4rem; }
+      h1 { margin-bottom: 0.25rem; }
+      h2 { margin-top: 2.25rem; font-size: 1.1rem; color: #64ffda; }
+      .lede { color: #8892b0; margin-top: 0; }
+      a { color: #64ffda; }
+      .callout {
+        border: 1px solid #233554;
+        background: #112240;
+        border-radius: 10px;
+        padding: 1rem 1.25rem;
+        margin: 1.75rem 0;
+      }
+      footer {
+        margin-top: 3rem;
+        padding-top: 1.5rem;
+        border-top: 1px solid #233554;
+        color: #8892b0;
+        font-size: 0.9rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Privacy policy</h1>
+      <p class="lede">Last updated: 11 September 2026</p>
+
+      <p>
+        AI Finance Tracker is a personal, open-source project run by an
+        individual developer, not a company. This page describes what the app
+        stores and who it is shared with, in plain terms.
+      </p>
+
+      <div class="callout">
+        This app does not connect to any bank and never asks for banking
+        credentials, card numbers, or account numbers. Everything in your
+        account is information you typed in or uploaded yourself.
+      </div>
+
+      <h2>What is collected</h2>
+      <ul>
+        <li>
+          <strong>Account details.</strong> The email address and password you
+          register with. Passwords are handled entirely by Firebase
+          Authentication and are never visible to the app or its developer.
+        </li>
+        <li>
+          <strong>Profile information.</strong> A display name, an optional
+          phone number, an optional avatar image, and your chosen category
+          preferences &mdash; all supplied by you.
+        </li>
+        <li>
+          <strong>Financial entries you create.</strong> Transaction
+          descriptions, amounts, dates, categories, income records, savings
+          records, and budget limits that you enter.
+        </li>
+        <li>
+          <strong>Uploaded statement files.</strong> If you use the PDF import
+          feature, the file you upload is parsed to extract transaction rows.
+          The extracted rows are shown to you for confirmation before anything
+          is stored, and the uploaded file itself is not retained after parsing.
+        </li>
+        <li>
+          <strong>Chat history.</strong> Questions you ask the assistant and its
+          replies, so follow-up questions have context.
+        </li>
+      </ul>
+
+      <h2>Where it is stored</h2>
+      <p>
+        All data is stored in Google Firebase (Firestore and Firebase
+        Authentication), under a per-user record keyed to your account. Security
+        rules restrict each record to the account that created it.
+      </p>
+
+      <h2>Who it is shared with</h2>
+      <p>
+        Your data is not sold, rented, or shared with advertisers. There is no
+        advertising or third-party tracking on this site. Data reaches exactly
+        two outside services:
+      </p>
+      <ul>
+        <li>
+          <strong>Google Firebase</strong> &mdash; hosting, authentication, and
+          the database.
+        </li>
+        <li>
+          <strong>Groq</strong> &mdash; the AI provider. When you use
+          categorization, chat, quick-add, statement extraction, or budget
+          nudges, the relevant text (for example a transaction description, or
+          the figures needed to answer your question) is sent to Groq's API to
+          generate the response. Do not enter anything into this app that you
+          would not be comfortable sending to a third-party AI provider.
+        </li>
+      </ul>
+
+      <h2>Your controls</h2>
+      <p>
+        Under Settings &rarr; Account &amp; security you can change your email
+        or password, export everything in your account as a JSON file, and
+        permanently delete your account along with its data.
+      </p>
+
+      <h2>Security and expectations</h2>
+      <p>
+        This is a hobby project, offered as-is with no warranty and no service
+        guarantee. Reasonable care has been taken &mdash; per-user data
+        isolation, authenticated API routes, no credential collection &mdash;
+        but it has not been independently audited, and you should not treat it
+        as you would a regulated financial service. Please use a password unique
+        to this site, and consider whether you want to enter genuinely sensitive
+        figures at all.
+      </p>
+
+      <h2>Contact</h2>
+      <p>
+        Privacy questions or security reports: open an issue at
+        <a href="https://github.com/aviralwilly-cyber/finance-tracker/issues">github.com/aviralwilly-cyber/finance-tracker/issues</a>.
+      </p>
+
+      <footer>
+        <a href="/">Home</a> &middot;
+        <a href="/about.html">About this project</a>
+      </footer>
+    </main>
+  </body>
+</html>
