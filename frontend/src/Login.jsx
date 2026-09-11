@@ -2,8 +2,7 @@ import { useEffect, useState } from 'react'
 import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
-  sendPasswordResetEmail,
-  sendEmailVerification
+  sendPasswordResetEmail
 } from 'firebase/auth'
 import { auth } from './firebase'
 import { API } from './api'
@@ -46,10 +45,7 @@ export default function Login() {
       if (mode === 'login') {
         await signInWithEmailAndPassword(auth, email, password)
       } else if (mode === 'signup') {
-        const credential = await createUserWithEmailAndPassword(auth, email, password)
-        // Send immediately on signup so the verification gate isn't the
-        // first place they hear about it.
-        await sendEmailVerification(credential.user).catch(() => {})
+        await createUserWithEmailAndPassword(auth, email, password)
       } else {
         await sendPasswordResetEmail(auth, email)
         // Deliberately worded so it doesn't confirm whether an account
@@ -106,7 +102,6 @@ export default function Login() {
           minHeight: '100vh',
           width: '100%',
           display: 'flex',
-          flexDirection: 'column',
           alignItems: 'center',
           justifyContent: 'center',
           padding: '1rem'
@@ -129,8 +124,43 @@ export default function Login() {
           <h1 style={{ marginBottom: 4, display: 'flex', alignItems: 'center', gap: 8 }}>
             <MoneyBagIcon className="w-7 h-7" /> AI Finance Tracker
           </h1>
-          <p style={{ color: theme.subtext, marginTop: 0, marginBottom: 24 }}>
+          <p style={{ color: theme.subtext, marginTop: 0, marginBottom: 12 }}>
             {heading}
+          </p>
+
+          {/* Plain-language context for anyone (or anything) landing here cold.
+              A bare credential form on a finance-named domain with no
+              surrounding content is what got this site flagged as phishing by
+              Google Safe Browsing; this block is the fix. Don't remove it. */}
+          <p style={{ color: theme.subtext, fontSize: 13, lineHeight: 1.55, marginTop: 0, marginBottom: 12 }}>
+            A free, open-source budgeting app for spending you record yourself.
+            Built as a personal portfolio project &mdash;{' '}
+            <a
+              href="https://github.com/aviralwilly-cyber/finance-tracker"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: theme.text }}
+            >
+              source code on GitHub
+            </a>.
+          </p>
+
+          <p
+            style={{
+              color: theme.subtext,
+              fontSize: 12,
+              lineHeight: 1.55,
+              margin: '0 0 20px',
+              padding: '10px 12px',
+              background: theme.inputBg,
+              border: `1px solid ${theme.border}`,
+              borderRadius: 8
+            }}
+          >
+            <strong style={{ color: theme.text }}>Not a bank.</strong> Not affiliated
+            with any bank or payment provider. This form creates a login for this app
+            only &mdash; it never asks for banking credentials, card numbers, or
+            account numbers. Please use a password unique to this site.
           </p>
 
           <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
@@ -200,15 +230,31 @@ export default function Login() {
               </>
             )}
           </p>
-        </div>
 
-        <p style={{
-          fontSize: 13, color: theme.subtext, textAlign: 'center',
-          marginTop: 20, marginBottom: 0, lineHeight: 1.7
-        }}>
-          Built and designed by Aviral Abel Willy.<br />
-          © 2026 All rights reserved.
-        </p>
+          <p
+            style={{
+              fontSize: 12,
+              color: theme.subtext,
+              marginTop: 20,
+              marginBottom: 0,
+              paddingTop: 14,
+              borderTop: `1px solid ${theme.border}`
+            }}
+          >
+            <a href="/about.html" style={{ color: theme.subtext }}>About this project</a>
+            {' · '}
+            <a href="/privacy.html" style={{ color: theme.subtext }}>Privacy</a>
+            {' · '}
+            <a
+              href="https://github.com/aviralwilly-cyber/finance-tracker"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: theme.subtext }}
+            >
+              GitHub
+            </a>
+          </p>
+        </div>
       </div>
     </div>
   )
